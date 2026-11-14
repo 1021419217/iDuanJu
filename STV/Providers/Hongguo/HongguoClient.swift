@@ -119,6 +119,11 @@ actor HongguoClient {
     /// Last automatic re-registration (soft-reject recovery). Throttle so a blocked network can't hammer device_register.
     private var lastAutoReregister: Date?
     private static let autoReregisterMinInterval: TimeInterval = 30
+    /// Soft-reject recovery has its own throttle. An explicit HTTP 200 + 0-byte verdict must never be
+    /// skipped just because the proactive stale-device renewal ran moments earlier and consumed the
+    /// shared timestamp (that made every later play fail until the user tapped 「重置红果设备注册」).
+    private var lastSoftRejectReregister: Date?
+    private static let softRejectReregisterMinInterval: TimeInterval = 5
 
     private static var hasPurePlayerOverride: Bool {
         guard let s = UserDefaults.standard.string(forKey: "stv.hg.purePlayerDevice") else { return false }
@@ -147,8 +152,8 @@ actor HongguoClient {
     private func reregisterAfterSoftReject(failedDeviceId did: String) async -> Bool {
         if Self.hasPurePlayerOverride { return false }          // user-pinned device: never replace it
         if let cur = device ?? HGDevice.load(), cur.deviceId != did { return true }
-        if let t = lastAutoReregister, Date().timeIntervalSince(t) < Self.autoReregisterMinInterval { return false }
-        lastAutoReregister = Date()
+        if let t = lastSoftRejectReregister, Date().timeIntervalSince(t) < Self.softRejectReregisterMinInterval { return false }
+        lastSoftRejectReregister = Date()
         resetDevice()
         do {
             let d = try await ensureDevice()
@@ -609,6 +614,16 @@ actor HongguoClient {
             }
         }
         if sawSoftReject {
+            // Last chance before giving up: force one fresh device_register and retry pure video_model.
+            // A newly registered device can need one extra request before upstream accepts it; this
+            // path is unthrottled because we are about to fail anyway, so it cannot hammer the API.
+            resetDevice()
+            do {
+                _ = try await ensureDevice()
+                if let r = try await resolvePureLevels(vid, sawSoftReject: &sawSoftReject) { return r }
+            } catch {
+                NSLog("[HG] final re-register retry failed: %@", String(describing: error))
+            }
             throw ProviderError.upstream("取流被上游空包拒绝（软拒绝）")
         }
         throw ProviderError.upstream("取链失败")

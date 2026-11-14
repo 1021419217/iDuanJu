@@ -85,7 +85,7 @@ targets:
       #   跟手位移改用绘制 offset，满足阈值后走既有的 close() 单一出口。
       #   不新建 UIView、不碰 UIWindow / 方向 / 转场 / 定时器；3.1 的减法成果全部保留。
       MARKETING_VERSION: "3.3"
-      CURRENT_PROJECT_VERSION: "31"
+      CURRENT_PROJECT_VERSION: "32"
       # 1.9(16)：HLSPlayback 的 finishLoading 需要 ObjC @try/@catch 包裹
       # （AVFCore 抛的是 Swift 捕获不到的 NSInternalInconsistencyException）。
       SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/STV/Playback/STV-Bridging-Header.h
