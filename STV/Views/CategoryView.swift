@@ -10,6 +10,8 @@ struct CategoryView: View {
     @State private var panelError: Error?
     @State private var selected: [String: String] = [:]
     @State private var pager = Pager()
+    /// 找剧只展示前 9 部，不再无限翻页加载冗余卡片与封面。
+    private static let maxItems = 9
 
     var body: some View {
         ScrollView {
@@ -38,7 +40,7 @@ struct CategoryView: View {
                 }
 
                 if let e = pager.error, pager.items.isEmpty { ErrorStateView(error: e) { reload() } }
-                else { NumberedGrid(items: pager.items, numbered: mode == .rank, hasMore: pager.hasMore, loading: pager.isLoading) { pager.loadMore() } }
+                else { NumberedGrid(items: Array(pager.items.prefix(Self.maxItems)), numbered: mode == .rank, hasMore: false, loading: pager.isLoading) }
             }.padding(.vertical, 10)
         }
         .background(STVTheme.bg.ignoresSafeArea())

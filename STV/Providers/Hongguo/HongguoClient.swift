@@ -617,7 +617,8 @@ actor HongguoClient {
             // Last chance before giving up: force one fresh device_register and retry pure video_model.
             // A newly registered device can need one extra request before upstream accepts it; this
             // path is unthrottled because we are about to fail anyway, so it cannot hammer the API.
-            resetDevice()
+            // 用户手动固定的设备不能被终态重注册清掉（与 ensureDevice / replaceDevice 一致）。
+            if !Self.hasPurePlayerOverride { resetDevice() }
             do {
                 _ = try await ensureDevice()
                 if let r = try await resolvePureLevels(vid, sawSoftReject: &sawSoftReject) { return r }

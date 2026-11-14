@@ -273,8 +273,11 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
                             repl = lk
                             STVLog.w("key route loopback \(lk.prefix(46))")
                         } else {
-                            repl = Self.keyScheme + "://key"
-                            STVLog.w("key route stvkey://key (loopback unavailable)")
+                            // loopback server 起不来时不再 fallback 到 stvkey://key：iOS 17 上自定义
+                            // scheme 作 key URI 根本不发请求，此分支必现 -19152。保留原始 URI 并显式
+                            // 记一条 FATAL 日志，把失败交给上层正常报错，不再静默走无效分支。
+                            repl = u.absoluteString
+                            STVLog.w("key route FATAL: loopback unavailable, original URI kept")
                         }
                     } else {
                         let ks = u.scheme == "http" ? Self.keyScheme + "-http" : Self.keyScheme

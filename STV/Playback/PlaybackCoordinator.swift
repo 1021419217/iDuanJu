@@ -55,12 +55,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         default:
             reason = "播放失败"
         }
-        var out = "\(reason)（\(ns.code)\(under)），点重试"
-        // 诊断尾部：把最近一次 HLS key/playlist 的真实结果直接摆在屏幕上，
-        // 这样失败时拍一张图就能判断是 403、超时还是根本没发请求。
-        let d = STVLog.diag
-        if !d.isEmpty { out += "\n" + String(d.prefix(72)) }
-        return out
+        return "\(reason)（\(ns.code)\(under)），点重试"
     }
 
     static let rateSteps: [Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
@@ -670,19 +665,8 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     }
 
     /// What the video surface shows right now (Metal / sample-buffer layers included).
-    /// AVPlayerLayer composites its frames out-of-process, so drawHierarchy on it yields an opaque
-    /// BLACK image, never the picture. Keeping that as the switch-over still covers the incoming
-    /// episode with black in portrait (time keeps advancing, no picture) -- the "episode 2+ is
-    /// black" symptom. Skip AVPlayer-backed surfaces; Aether's Metal / sample-buffer layers still
-    /// snapshot normally and keep the anti-flash behaviour.
     static func snapshot(_ v: UIView) -> UIImage? {
         guard v.bounds.width > 0, v.bounds.height > 0, v.window != nil else { return nil }
-        let root = v.layer
-        if root is AVPlayerLayer { return nil }
-        for a in root.sublayers ?? [] {
-            if a is AVPlayerLayer { return nil }
-            for b in a.sublayers ?? [] { if b is AVPlayerLayer { return nil } }
-        }
         let f = UIGraphicsImageRendererFormat.preferred(); f.opaque = true
         return UIGraphicsImageRenderer(bounds: v.bounds, format: f).image { _ in
             _ = v.drawHierarchy(in: v.bounds, afterScreenUpdates: false)
