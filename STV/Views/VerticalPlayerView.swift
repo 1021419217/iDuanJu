@@ -135,7 +135,7 @@ struct PlayerScreen: View {
                         .accessibilityElement().accessibilityIdentifier("player.video").accessibilityValue(fillScreen ? "fill" : "fit")
                         .frame(width: area.width, height: area.height).offset(x: area.minX, y: area.minY - pageDrift(co.current ?? 0, page: full.height))
                         .allowsHitTesting(false)
-                    if let held = co.heldFrame, !landscape {
+                    if let held = co.heldFrame, !landscape, co.readyIndex == nil {
                         // Previous episode's last frame, riding with the swipe until the next one is on screen.
                         Image(uiImage: held.image).resizable()
                             .frame(width: area.width, height: area.height).offset(x: area.minX, y: area.minY - pageDrift(held.index, page: full.height))
@@ -388,9 +388,16 @@ struct PlayerScreen: View {
     @State private var feedSettled = true
 
     /// Offset of page `index` from rest (portrait), capped at one page either way.
+    /// iOS 17 has no scroll-geometry callback, so `feedScrollY` stays 0 forever. From episode 2
+    /// onward that stale value resolves to a full-page drift and pushes the single in-window video
+    /// layer off screen: audio and the timeline keep running, and rotating to landscape (which
+    /// returns 0 here) brings the picture straight back. Only apply parallax while a scroll is
+    /// actually being tracked; otherwise the video layer must stay at rest.
     private func pageDrift(_ index: Int, page: CGFloat) -> CGFloat {
         guard !landscape, page > 0 else { return 0 }
-        return max(-page, min(page, feedScrollY - CGFloat(index) * page))
+        let d = feedScrollY - CGFloat(index) * page
+        guard !feedSettled, abs(d) < page else { return 0 }
+        return max(-page, min(page, d))
     }
 
     private func stage(_ i: Int) -> some View {
