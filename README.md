@@ -160,3 +160,5 @@ sandboxed QuickJS plugin system (per-plugin domain allow-list, isolated cookies/
 - Adult (18+) sources are off by default and require explicit unlock.
 - For personal study only; respect each site's Terms of Service and your local laws.
 - **License: GPL-3.0.** This project is free. **Selling or paid distribution is prohibited**; any derivative work must stay open source under GPL-3.0.
+
+<!-- ci-ping: trigger build after native HLS fixes -->
