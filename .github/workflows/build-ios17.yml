@@ -1,6 +1,9 @@
 name: Build iOS 17 IPA
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       runner:
