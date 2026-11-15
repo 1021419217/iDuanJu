@@ -377,9 +377,12 @@ struct PlayerScreen: View {
         .scrollDisabled(speedMode || scrubbing || co.pipActive || panel != nil || seekDrag != nil)
     }
 
-    /// Drop the previous episode's still once the new one is playing and the page has stopped moving.
+    /// Drop the previous episode's still as soon as the new one is ready.
+    /// Do not gate this on feedSettled: picking an episode from the sheet emits no scroll-settle
+    /// callback, so that flag could stay false forever and leave the (black) still covering the
+    /// picture indefinitely -- "episode 2+ plays with audio/progress but a black screen".
     private func releaseHeldIfSettled() {
-        guard co.heldFrame != nil, let r = co.readyIndex, r == co.current, feedSettled else { return }
+        guard co.heldFrame != nil, let r = co.readyIndex, r == co.current else { return }
         co.releaseHeldFrame()
     }
     @State private var feedSettled = true
