@@ -3,8 +3,6 @@ import SwiftUI
 struct SearchView: View {
     var pushed = false
     var initialQuery: String? = nil
-    /// 从某个站源的首页点搜索时传入：进页面就选中该站源。
-    var initialSource: DramaSource? = nil
     var startEditingHistory = false
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
@@ -17,6 +15,7 @@ struct SearchView: View {
     }()
     @State private var pager = Pager()
     @State private var hot: [HGSeries] = []
+    @State private var hotError: Error?
     @State private var discoverSeed = 0
     @State private var editingHistory = false
     private let library = LibraryStore.shared
@@ -32,7 +31,6 @@ struct SearchView: View {
         .background(STVTheme.bg.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
         .task {
-            if let s = initialSource, source != s { source = s }
             if startEditingHistory { editingHistory = true }
             if let q = initialQuery, submitted.isEmpty, !q.isEmpty { query = q; submit() }
             if hot.isEmpty { await loadHot() }
@@ -75,6 +73,20 @@ struct SearchView: View {
                     ChipFlow(items: discover, accent: { t in discover.firstIndex(of: t) == 0 ? "热" : (discover.firstIndex(of: t) == 1 ? "荐" : nil) }) { pick($0) }
                 }
             }
+            VStack(alignment: .leading, spacing: 12) {
+                SectionHeader(title: "搜索实时排行")
+                if let hotError, hot.isEmpty { ErrorStateView(error: hotError) { Task { await loadHot() } } }
+                else if hot.isEmpty {
+                    HStack(spacing: 8) { ForEach(0..<3, id: \.self) { _ in ShimmerBlock().aspectRatio(0.6, contentMode: .fit) } }.padding(.horizontal, 16)
+                } else {
+                    HStack(spacing: 8) {
+                        ForEach(0..<min(3, hot.count), id: \.self) { i in TopRankCard(series: hot[i], rank: i + 1) }
+                    }.padding(.horizontal, 16)
+                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)], spacing: 14) {
+                        ForEach(Array(hot.dropFirst(3).enumerated()), id: \.element.id) { i, s in CompactRankRow(series: s, rank: i + 4) }
+                    }.padding(.horizontal, 16)
+                }
+            }
         }.padding(.vertical, 8)
     }
 
@@ -104,9 +116,11 @@ struct SearchView: View {
         else if let p = Sites.provider(source) { pager.reset { prev, _ in try await p.search(q, page: max(1, prev.nextOffset ?? 1)) } }
     }
     private func loadHot() async {
-        // 「搜索发现」只需十几个词条：一次请求即可，不再为已移除的实时排行拉第二页 / 23 条。
-        guard let p = try? await HongguoClient.shared.rank(sub: .hotSearch, genre: .all) else { return }
-        hot = Array(p.items.prefix(12))
+        do {
+            var p = try await HongguoClient.shared.rank(sub: .hotSearch, genre: .all)
+            if p.hasMore, let more = try? await HongguoClient.shared.rank(sub: .hotSearch, genre: .all, offset: p.nextOffset ?? 0, seenIds: p.items.map(\.seriesId)) { p.items += more.items }
+            hot = Array(p.items.prefix(23)); hotError = nil
+        } catch { hotError = error }
     }
 }
 

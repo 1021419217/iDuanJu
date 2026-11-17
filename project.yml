@@ -14,8 +14,8 @@ packages:
   QuickJS:
     path: Packages/QuickJS
   AetherEngine:
-    url: https://github.com/carrolltony930/AetherEngine
-    branch: main
+    url: https://github.com/1021419217/AetherEngine
+    from: 7.62.0
 targets:
   STV:
     type: application
@@ -31,73 +31,31 @@ targets:
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: com.local.STV
       GENERATE_INFOPLIST_FILE: YES
-      # 版本规则：每次功能更新 MARKETING_VERSION +0.1（1.6 → 1.7 → 1.8 …），
-      # CURRENT_PROJECT_VERSION 同步 +1。TrollStore 靠 build 号判断覆盖安装，两个都要涨。
-      # 2.0(17)：黄果线路自动发现 + /api/search 接口探测，修复「选到发布页导致点播放失败」。
-      # 2.2(19)：黄果加密 HLS 强制走 HLSPlayback 自代理 key（修 -19152）；播放器去掉两侧
-      # 快进/快退圆钮、缩小暂停键，报错时不再画中心按钮，错误文案改短中文。
-      # 2.3(20)：加运行日志（Documents/stv.log，可见于「文件」App）+ 失败浮层显示 key/playlist
-      # 真实结果，用于定位 -19152 到底卡在 403、超时还是没发请求。
-      # 2.4(21)：AES key 改由 loopback http 提供（/k/<hex>），不再用自定义 scheme —— iOS 17
-      # 对 stvkey:// 作 key URI 根本不发请求，必落 -19152。保留全部诊断日志。
-      # 2.6(23)：
-      # 1) 「点视频没进去、只剩左上角 Back、点哪都没反应」——根因是播放器在 push 转场那一帧
-      #    调 setNeedsUpdateOfSupportedInterfaceOrientations()（OrientationGate.unlock），把导航
-      #    转场打断。改为转场结束 0.6s 后再解锁，并加 NavBarHealer 兜底纠正残留的导航栏。
-      # 2) 起播提速：playlist 请求补 10s 超时（原来默认 60s，一个挂住的请求就能拖 20–30 秒）；
-      #    解析只取前 2 档清晰度；resolve 拉过的 playlist 原文喂给 resourceLoader，省一次往返；
-      #    直连 HLS 关掉「缓冲堆满才开画面」。
-      # 3) 设置 → 站源管理：内置源（含红果）与站点源可拖动排序、左滑删除、单个恢复/全部恢复。
-      # 4) 频道面板去掉「子频道」一排（首页各源自己的分类条保留）。
-      # 2.7(24)：彻底修「点视频后下半屏黑、触摸全死、图还在动」。
-      #   根因：播放器靠 NavigationStack push 呈现，转场会被方向掩码刷新 / 边缘返回手势 /
-      #   播放器自己的 7 个 UIKit 手势打断；UIKit 把进行中的转场切成 interactive 后无人收尾，
-      #   UITransitionView 停在半路盖住全屏吃掉触摸，而底层 SwiftUI 动画仍在跑。
-      #   改法：播放器全部改为 fullScreenCover（PlayerPresenter），导航栈里不再出现播放器；
-      #   另加 transitionCoordinator 守卫 + close 后释放残留转场层。版本 2.7(24)。
-      # 2.8(25)：播放器改为 SwiftUI 叠层（overlay），彻底不创建 UIKit 转场控制器。
-      #   2.7 换成 fullScreenCover 后仍能在「进出五六次」后复现，且这次没有 < Back、
-      #   画面干净、轮播还在动 —— 残留的是 modal 的 presentation 容器（透明、全屏、吃触摸）。
-      #   叠层只有视图插入/移除，没有可残留的容器，也没有可被打断的动画。
-      # 2.9(26)：补掉叠层方案剩下的三个入口，并加**运行时自愈**。
-      #   ① 播放器在屏时禁用导航栈的边缘返回手势（否则被 pop 的是播放器背后的详情页，
-      #      交互式 pop 一旦被打断，UITransitionView 又留在窗口上）。
-      #   ② 方向解锁从「非结构化 Task」改成 `.task`：视图消失即取消，不再在已关闭的
-      #      页面上请求重算方向。
-      #   ③ 新增 WindowGuard：每秒一次窗口中心 hitTest + 尺寸校验，发现「看不见但吃触摸」
-      #      的层、根视图被禁用、窗口尺寸错位就地纠正。即使根因判断有遗漏，用户最多卡 1 秒
-      #      就自动恢复，不会再出现「必须杀进程」。
-      # 3.1(28)：**减法版本**。2.6 起加入的那一整套「清理残留转场层」代码，遍历
-      # UIWindow.subviews 把类名含 TransitionView 的视图关交互 / 隐藏。但 iOS 的窗口
-      # 层级本来就是 UIWindow -> UITransitionView -> rootViewController.view，那个
-      # UITransitionView 是承载整个 App 界面的正常系统容器，一直存在且多数时候无动画。
-      # 于是：关交互 = 「画面正常、轮播还在动、点哪都没反应」；隐藏 = 黑屏；
-      # 3.0 每秒跑一次的定时器 = 启动后第 1 秒必黑。这一整串卡死 / 黑屏都由它造成。
-      # 本版把 WindowGuard / NavBarHealer 全部停用，删掉所有窗口手术与方向编排，
-      # 播放器回到纯 SwiftUI overlay 的插入 / 移除，不再碰任何 UIKit 窗口层级。
-      # 3.2(29)：补回竖屏播放器的左边缘右滑返回（3.1 减法版本之上）。
-      #   播放器 2.8 起是 RootTabView 上的 SwiftUI 叠层，不在导航栈里，
-      #   UINavigationController.interactivePopGestureRecognizer 对它没有 pop 目标；
-      #   CatcherView.hitTest 又把左边缘 36pt 放行给那个已不存在的手势，
-      #   于是这一带触摸无人接管 —— 表现为「从左侧往右滑没反应」。
-      #   现在：CatcherView 自己接住这条带（不放行到背后详情页，避免误 pop），
-      #   由 PlayerScreen 上纯 SwiftUI 的 simultaneousGesture 识别左边缘右滑，
-      #   跟手位移改用绘制 offset，满足阈值后走既有的 close() 单一出口。
-      #   不新建 UIView、不碰 UIWindow / 方向 / 转场 / 定时器；3.1 的减法成果全部保留。
-      MARKETING_VERSION: "3.4"
-      CURRENT_PROJECT_VERSION: "34"
-      # 1.9(16)：HLSPlayback 的 finishLoading 需要 ObjC @try/@catch 包裹
-      # （AVFCore 抛的是 Swift 捕获不到的 NSInternalInconsistencyException）。
-      SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/STV/Playback/STV-Bridging-Header.h
+      # 版本规则：每次功能更新 MARKETING_VERSION +0.1，CURRENT_PROJECT_VERSION +1。
+      # 3.5 = 上游 UI 重设计 + 红果 CF 验证升级，降级 iOS 17。
+      MARKETING_VERSION: "3.5"
+      CURRENT_PROJECT_VERSION: "35"
       SWIFT_EMIT_LOC_STRINGS: YES
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
       ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    postBuildScripts:
+      - name: Debug-only local color-bar fixture
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ "$CONFIGURATION" = "Debug" ]; then
+            cp "$SRCROOT/STVTests/Fixtures/player_landscape.mp4" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/ui_color_bars.mp4"
+            cp "$SRCROOT/STVTests/Fixtures/novel_sample_gbk.txt" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/novel_sample_gbk.txt"
+            mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/ui_legado"
+            cp -R "$SRCROOT/STVTests/Fixtures/legado/" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/ui_legado/"
+            mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/ui_novel_preview"
+            cp -R "$SRCROOT/STVTests/Fixtures/ui_novel_preview/" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/ui_novel_preview/"
+          fi
     info:
       path: STV/Info.plist
       properties:
         CFBundleDisplayName: i短剧
-        UIFileSharingEnabled: true
-        LSSupportsOpeningDocumentsInPlace: true
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSFaceIDUsageDescription: 用于解锁「片源管理」里隐藏的长视频片源
         NSPhotoLibraryAddUsageDescription: 用于把你下载的图片和视频保存到相册
         LSApplicationQueriesSchemes: [tg]
@@ -126,6 +84,7 @@ targets:
       - path: STVTests
         excludes:
           - "Fixtures/Plugins/**"
+          - "Fixtures/ui_novel_preview/**"
     dependencies:
       - target: STV
     settings:

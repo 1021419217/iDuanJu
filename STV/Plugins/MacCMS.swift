@@ -127,6 +127,9 @@ struct MacCMSProvider: SiteProvider {
         guard data.count < 8 << 20, let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             throw ProviderError.upstream("采集站没有返回 JSON（可能只支持 XML 或需要 ?ac=detail）")
         }
+        if let code = o["code"], PluginOut.s(code) != "1" {
+            throw ProviderError.upstream("采集站：" + PluginOut.s(o["msg"]).nonEmptyOr("请求失败"))
+        }
         return o
     }
 
@@ -230,6 +233,8 @@ struct MacCMSProvider: SiteProvider {
         var q = ["ac": "detail", "pg": String(p)]
         if !c.id.isEmpty { q["t"] = c.id }
         let o = try await Self.fetch(site.api, q)
+        // Only the unfiltered latest page carries the site-wide class list. A category
+        // response can contain a partial class array and must not replace the home modules.
         if c.id.isEmpty, p == 1, case let cats = Self.parseCategories(o), !cats.isEmpty {
             let k = site.key
             await MainActor.run { CMSStore.shared.cacheCategories(k, cats) }

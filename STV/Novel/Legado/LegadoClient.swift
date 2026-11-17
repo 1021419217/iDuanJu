@@ -47,7 +47,75 @@ enum LegadoContent {
 
 /// Book-source operations (synchronous; call from a worker via the async wrappers).
 enum LegadoClient {
-    static func search(_ s: LegadoSource, key: String, page: Int = 1) throws -> [LegadoSearchItem] {
+    struct ExploreCategory: Hashable, Identifiable {
+        var title: String
+        var url: String
+        var group: String = "推荐"
+        var action: String? = nil
+        var id: String { group + "|" + title + "|" + url + "|" + (action ?? "") }
+    }
+
+    static func exploreCategories(_ s: LegadoSource) throws -> [ExploreCategory] {
+        guard var raw = s.exploreUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return [] }
+        if raw.hasPrefix("@js:") || raw.hasPrefix("<js>") {
+            let code = raw.hasPrefix("@js:") ? String(raw.dropFirst(4)) : raw.replacingOccurrences(of: "<js>", with: "").replacingOccurrences(of: "</js>", with: "")
+            let value = try LegadoContext(source: s).evalJS(code, result: nil, baseURL: s.bookSourceUrl)
+            if let array = value as? [[String: Any]] {
+                raw = String(decoding: try JSONSerialization.data(withJSONObject: array), as: UTF8.self)
+            } else if let array = value as? [Any], JSONSerialization.isValidJSONObject(array) {
+                raw = String(decoding: try JSONSerialization.data(withJSONObject: array), as: UTF8.self)
+            } else { raw = LegadoAnalyzer.textOf(value) }
+        }
+        return try parseExploreCategories(raw)
+    }
+
+    static func parseExploreCategories(_ raw: String) throws -> [ExploreCategory] {
+        var entries: [ExploreCategory] = []
+        var group = "推荐"
+        func add(_ title: String, _ url: String, _ action: String? = nil) {
+            let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let url = url.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { return }
+            if let action, !action.isEmpty { entries.append(ExploreCategory(title: title, url: "", group: group, action: action)) }
+            else if url.isEmpty { group = title }
+            else { entries.append(ExploreCategory(title: title, url: url, group: group)) }
+        }
+        if let data = raw.data(using: .utf8), let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            for item in array {
+                let type = item["type"] as? String
+                add((item["title"] as? String) ?? "", (item["url"] as? String) ?? "", type == "button" ? item["action"] as? String : nil)
+            }
+        } else {
+            if raw.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[") { throw LegadoError.rule("发现栏目 JSON 格式错误") }
+            for item in raw.components(separatedBy: "&&").flatMap({ $0.components(separatedBy: "\n") }) {
+                let text = item.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { continue }
+                if let range = text.range(of: "::") {
+                    add(String(text[..<range.lowerBound]), String(text[range.upperBound...]))
+                } else if text.hasPrefix("http://") || text.hasPrefix("https://") || text.hasPrefix("/") {
+                    add("推荐", text)
+                } else {
+                    group = text
+                }
+            }
+        }
+        var seen = Set<String>()
+        return entries.filter { seen.insert($0.id).inserted }
+    }
+
+    static func exploreAction(_ source: LegadoSource, category: ExploreCategory) throws {
+        guard let action = category.action else { return }
+        _ = try LegadoContext(source: source).evalJS(action, result: nil, baseURL: source.bookSourceUrl)
+    }
+
+    static func explore(_ s: LegadoSource, category: ExploreCategory, page: Int = 1) throws -> [LegadoSearchItem] {
+        var source = s
+        source.searchUrl = category.url
+        source.ruleSearch = (s.ruleSearch ?? [:]).merging((s.ruleExplore ?? [:]).filter { !$0.value.isEmpty }) { _, new in new }
+        return try search(source, key: "", page: page, allowDetailFallback: false)
+    }
+
+    static func search(_ s: LegadoSource, key: String, page: Int = 1, allowDetailFallback: Bool = true) throws -> [LegadoSearchItem] {
         let ctx = LegadoContext(source: s)
         ctx.key = key
         ctx.page = page
@@ -56,22 +124,26 @@ enum LegadoClient {
         let resp = try r.fetch()
         let base = resp.url.absoluteString
         let rules = s.ruleSearch ?? [:]
+        guard !(rules["bookList"] ?? "").isEmpty, !(rules["name"] ?? "").isEmpty, !(rules["bookUrl"] ?? "").isEmpty else {
+            throw LegadoError.rule("\(s.bookSourceName)：缺少书籍列表、书名或详情地址规则")
+        }
         let page = LegadoAnalyzer(resp.text, baseURL: base, ctx: ctx)
         let list = try page.elements(rules["bookList"] ?? "")
         var out: [LegadoSearchItem] = []
         for el in list {
             let a = LegadoAnalyzer(el, baseURL: base, ctx: ctx)
             func f(_ k: String) -> String { (try? a.string(rules[k] ?? "")) ?? "" }
-            let name = clean(f("name"))
+            let name = clean(try a.string(rules["name"] ?? ""))
             guard !name.isEmpty else { continue }
-            var bookURL = f("bookUrl")
-            bookURL = bookURL.isEmpty ? base : LegadoURL.absolute(bookURL, base: base)
+            let rawBookURL = try a.string(rules["bookUrl"] ?? "")
+            guard !rawBookURL.isEmpty else { continue }
+            let bookURL = LegadoURL.absolute(rawBookURL, base: base)
             out.append(LegadoSearchItem(name: name, author: cleanAuthor(f("author")), kind: f("kind").replacingOccurrences(of: "\n", with: " · "),
                     intro: f("intro"), cover: LegadoURL.absolute(f("coverUrl"), base: base), latest: f("lastChapter"),
                     bookURL: bookURL, sourceURL: s.bookSourceUrl, sourceName: s.bookSourceName))
         }
         // Some sites jump straight to the book page when there is one hit.
-        if out.isEmpty, let info = try? info(s, html: resp.text, url: base, ctx: ctx), !info.name.isEmpty {
+        if allowDetailFallback, out.isEmpty, let info = try? info(s, html: resp.text, url: base, ctx: ctx), !info.name.isEmpty {
             out.append(LegadoSearchItem(name: info.name, author: info.author, kind: info.kind, intro: info.intro, cover: info.cover,
                     latest: info.latest, bookURL: base, sourceURL: s.bookSourceUrl, sourceName: s.bookSourceName))
         }
@@ -93,8 +165,10 @@ enum LegadoClient {
             a = LegadoAnalyzer(first, baseURL: url, ctx: ctx)
         }
         func f(_ k: String) -> String { (try? a.string(rules[k] ?? "")) ?? "" }
+        // Name rules can persist book variables (e.g. 七猫's bid) used by toc/content.
+        let name = clean(f("name"))
         let toc = f("tocUrl")
-        return LegadoBookInfo(name: clean(f("name")), author: cleanAuthor(f("author")), intro: f("intro"),
+        return LegadoBookInfo(name: name, author: cleanAuthor(f("author")), intro: f("intro"),
             cover: LegadoURL.absolute(f("coverUrl"), base: url), kind: f("kind").replacingOccurrences(of: "\n", with: " · "),
             latest: f("lastChapter"), tocURL: toc.isEmpty ? (original ?? url) : LegadoURL.absolute(toc, base: url))
     }
@@ -116,6 +190,8 @@ enum LegadoClient {
             let page = LegadoAnalyzer(resp.text, baseURL: base, ctx: ctx)
             for el in try page.elements(rules["chapterList"] ?? "") {
                 let a = LegadoAnalyzer(el, baseURL: base, ctx: ctx)
+                let isVolume = (try? a.string(rules["isVolume"] ?? "")) ?? ""
+                if isVolume == "true" || isVolume == "1" { continue }
                 let title = ((try? a.string(rules["chapterName"] ?? "")) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let cu = (try? a.string(rules["chapterUrl"] ?? "")) ?? ""
                 guard !title.isEmpty else { continue }
@@ -143,7 +219,11 @@ enum LegadoClient {
         while let u = url, seen.count < 30, seen.insert(u).inserted {
             let r = try LegadoURL.request(u, ctx: ctx, base: s.bookSourceUrl)
             let resp = try r.fetch()
-            let base = resp.url.absoluteString
+            // Source rules use URL fragments as chapter IDs; HTTP never sends them to the server.
+            var base = resp.url.absoluteString
+            if let fragment = URL(string: u)?.fragment, !fragment.isEmpty {
+                base = base.components(separatedBy: "#")[0] + "#" + fragment
+            }
             let a = LegadoAnalyzer(resp.text, baseURL: base, ctx: ctx)
             parts.append(try a.strings(rules["content"] ?? "").joined(separator: "\n"))
             url = nil
@@ -152,7 +232,8 @@ enum LegadoClient {
                 if abs != nextChapterURL, !seen.contains(abs) { url = abs }
             }
         }
-        var text = LegadoContent.clean(parts.joined(separator: "\n"))
+        let combined = parts.joined(separator: "\n")
+        var text = LegadoContent.clean(combined)
         if let rr = rules["replaceRegex"], !rr.isEmpty {
             for piece in rr.components(separatedBy: "\n") where !piece.isEmpty {
                 let p = piece.hasPrefix("##") ? String(piece.dropFirst(2)) : piece
@@ -161,7 +242,7 @@ enum LegadoClient {
             }
             text = NovelImport.normalize(text)
         }
-        guard !text.isEmpty else { throw LegadoError.empty("正文为空") }
+        guard !text.isEmpty else { throw LegadoError.empty(combined.range(of: "<img\\b", options: [.regularExpression, .caseInsensitive]) != nil ? "本章是图片页，当前文本阅读器无法显示，请换文字版书源" : "正文为空") }
         return text
     }
 

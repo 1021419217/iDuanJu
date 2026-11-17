@@ -33,12 +33,14 @@ val LocalNavigate = androidx.compose.runtime.staticCompositionLocalOf<(String) -
 @Composable
 fun RootScreen(initialRoute: String? = null) {
     val nav = rememberNavController()
-    LaunchedEffect(initialRoute) { initialRoute?.let { runCatching { nav.navigate(it) } } }
+    LaunchedEffect(initialRoute) { initialRoute?.takeUnless { it == "home" }?.let { runCatching { nav.navigate(it) } } }
     val updater = app.iduanju.IdjApp.instance.updater
     LaunchedEffect(Unit) { updater.autoCheck() }
     var tab by remember { mutableIntStateOf(0) }
+    var novelImmersive by remember { mutableStateOf(false) }
     val back = nav.currentBackStackEntryAsState().value
     val route = back?.destination?.route ?: "home"
+    LaunchedEffect(route) { when(route) { "home" -> tab=0; "search" -> tab=1; "category" -> tab=2; "profile" -> tab=3 } }
     val atRoot = route in setOf("home", "search", "category", "profile")
     /** Backdrop for the floating tab bar's blur (Haze): everything the NavHost draws. */
     val haze = androidx.compose.runtime.remember { dev.chrisbanes.haze.HazeState() }
@@ -54,15 +56,18 @@ fun RootScreen(initialRoute: String? = null) {
         }
         androidx.compose.runtime.CompositionLocalProvider(LocalNavigate provides navigate) {
             NavHost(nav, startDestination = "home", modifier = Modifier.fillMaxSize().hazeSource(haze)) {
-                composable("home") { HomeScreen(onOpenDetail = { nav.navigate("detail/$it") }, onSearch = { nav.navigate("search") }, onPlay = { nav.navigate("player/$it/0") }, onOpenManga = { nav.navigate("manga/" + android.net.Uri.encode(it)) }) }
+                composable("home") { HomeScreen(onOpenDetail = { nav.navigate("detail/$it") }, onSearch = { nav.navigate("search") }, onPlay = { nav.navigate("player/$it/0") }, onOpenManga = { nav.navigate("manga/" + android.net.Uri.encode(it)) }, onImmersiveChanged = { novelImmersive = it }) }
                 composable("search") { SearchScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
                 composable("category") { CategoryScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
                 composable("library/{kind}") { e -> app.iduanju.ui.library.LibraryListScreen(e.arguments!!.getString("kind")!!, onBack = { nav.popBackStack() }, onOpenDetail = { nav.navigate("detail/$it") }) }
                 composable("profile") { ProfileScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
                 composable("sources") { app.iduanju.ui.profile.SourcesScreen(onBack = { nav.popBackStack() }) }
                 composable("plugins") { app.iduanju.ui.profile.PluginsScreen(onBack = { nav.popBackStack() }) }
+                composable("novel") { app.iduanju.novel.NovelScreen(onBack = { nav.popBackStack() }) }
                 composable("licenses") { app.iduanju.ui.profile.LicensesScreen(onBack = { nav.popBackStack() }) }
-                composable("actorRank") { app.iduanju.ui.profile.ActorRankPlaceholder(onBack = { nav.popBackStack() }) }
+                composable("actorRank") { app.iduanju.ui.profile.ActorRankScreen(onBack = { nav.popBackStack() }, onSearch = { nav.navigate("actorSearch/" + android.net.Uri.encode(it)) }) }
+                composable("actorSearch/{name}") { e -> SearchScreen(onOpenDetail = { nav.navigate("detail/$it") }, initialQuery = e.arguments!!.getString("name")!!) }
+                composable("board/{genre}/{sub}") { e -> app.iduanju.ui.category.BoardScreen(app.iduanju.ui.home.BoardSpec(app.iduanju.core.hongguo.HGRankGenre.valueOf(e.arguments!!.getString("genre")!!), app.iduanju.core.hongguo.HGRankSub.valueOf(e.arguments!!.getString("sub")!!)), onBack = { nav.popBackStack() }, onOpenDetail = { nav.navigate("detail/$it") }) }
                 composable("detail/{sid}", arguments = listOf(navArgument("sid") { type = NavType.StringType })) { e ->
                     val sid = e.arguments!!.getString("sid")!!
                     DetailScreen(
@@ -93,7 +98,7 @@ fun RootScreen(initialRoute: String? = null) {
             }
 
         }
-        if (atRoot) {
+        if (atRoot && !(route == "home" && novelImmersive)) {
             GlassTabBar(
                 selected = tab,
                 items = listOf(

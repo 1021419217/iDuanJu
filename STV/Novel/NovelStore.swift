@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import CryptoKit
 
 /// A book on the shelf. Imported files are converted once to `book.txt` (UTF-8) + chapter ranges, so
 /// TXT and EPUB read the same way. Stored under Documents/Novels/<id>/.
@@ -93,14 +94,38 @@ final class NovelStore {
         save(progress, "stv.novel.progress")
     }
 
-    nonisolated static func chapterFile(_ b: NovelBook, _ i: Int) -> URL { dir(b.id).appendingPathComponent("ch/\(i).txt") }
+    nonisolated static func chapterFile(_ b: NovelBook, _ i: Int) -> URL {
+        if let urls = b.chapterURLs, urls.indices.contains(i) {
+            let identity = (b.sourceURL ?? "") + "\n" + (b.bookURL ?? "") + "\n" + urls[i]
+            let digest = SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
+            return dir(b.id).appendingPathComponent("chapters/" + digest + ".txt")
+        }
+        return dir(b.id).appendingPathComponent("ch/\(i).txt")
+    }
 
-    func isCached(_ b: NovelBook, _ i: Int) -> Bool { !b.isWeb || FileManager.default.fileExists(atPath: Self.chapterFile(b, i).path) }
+    func isCached(_ b: NovelBook, _ i: Int) -> Bool {
+        guard b.chapters.indices.contains(i) else { return false }
+        if !b.isWeb { return true }
+        migrateLegacyCache(b)
+        return ((try? FileManager.default.attributesOfItem(atPath: Self.chapterFile(b, i).path)[.size] as? NSNumber)?.intValue ?? 0) > 0
+    }
 
-    func cache(_ b: NovelBook, _ i: Int, _ text: String) {
+    func cache(_ b: NovelBook, _ i: Int, _ text: String) throws {
+        guard books.contains(where: { $0.id == b.id }), b.chapters.indices.contains(i), !text.isEmpty else { throw LegadoError.empty("书籍已删除或章节为空") }
         let f = Self.chapterFile(b, i)
-        try? FileManager.default.createDirectory(at: f.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? Data(text.utf8).write(to: f)
+        try FileManager.default.createDirectory(at: f.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(text.utf8).write(to: f, options: .atomic)
+    }
+
+    func cachedCount(_ book: NovelBook) -> Int { book.chapters.indices.filter { isCached(book, $0) }.count }
+
+    func transferProgress(from old: NovelBook, to new: NovelBook) {
+        guard !new.chapters.isEmpty, let progress = progress[old.id] else { return }
+        func normal(_ s: String) -> String { s.components(separatedBy: .whitespacesAndNewlines).joined() }
+        let title = old.chapters.indices.contains(progress.chapter) ? normal(old.chapters[progress.chapter].title) : ""
+        let index = new.chapters.firstIndex { !title.isEmpty && normal($0.title) == title } ?? min(progress.chapter, new.chapters.count - 1)
+        // Chapter bodies differ between sources: preserve the chapter, start at its beginning.
+        record(new, chapter: index, offset: 0)
     }
 
     /// Adds a book found through a 书源 (or returns the one already on the shelf).
@@ -125,9 +150,27 @@ final class NovelStore {
 
     func webBook(source: String, url: String) -> NovelBook? { books.first { $0.sourceURL == source && $0.bookURL == url } }
 
-    /// New chapters from a refreshed 目录 (cached text is kept by index).
+    /// Legacy indexed files must be migrated once, before any TOC changes.
+    private func migrateLegacyCache(_ b: NovelBook) {
+        let marker = Self.dir(b.id).appendingPathComponent("cache-v2.migrated")
+        guard b.isWeb, !FileManager.default.fileExists(atPath: marker.path) else { return }
+        do {
+            for j in b.chapters.indices {
+                let old = Self.dir(b.id).appendingPathComponent("ch/\(j).txt")
+                let target = Self.chapterFile(b, j)
+                if FileManager.default.fileExists(atPath: old.path), !FileManager.default.fileExists(atPath: target.path) {
+                    let text = try String(contentsOf: old, encoding: .utf8)
+                    if !text.isEmpty { try cache(b, j, text) }
+                }
+            }
+            try Data().write(to: marker, options: .atomic)
+        } catch { /* Leave the marker absent so a failed write can be retried. */ }
+    }
+
+    /// New chapters from a refreshed TOC; cache identity follows URLs, not row positions.
     func updateToc(_ b: NovelBook, _ toc: [LegadoChapter]) {
         guard let i = books.firstIndex(where: { $0.id == b.id }), !toc.isEmpty else { return }
+        migrateLegacyCache(books[i])
         books[i].chapters = toc.enumerated().map { NovelChapter(title: $1.title, start: $0 * 1000, end: ($0 + 1) * 1000) }
         books[i].chapterURLs = toc.map(\.url)
         save(books, "stv.novel.books")
@@ -144,7 +187,7 @@ final class NovelStore {
 
     func chapterText(_ b: NovelBook, _ i: Int) -> String {
         guard b.chapters.indices.contains(i) else { return "" }
-        if b.isWeb { return (try? String(contentsOf: Self.chapterFile(b, i), encoding: .utf8)) ?? "" }
+        if b.isWeb { migrateLegacyCache(b); return (try? String(contentsOf: Self.chapterFile(b, i), encoding: .utf8)) ?? "" }
         let c = b.chapters[i]
         let ns = text(b) as NSString
         guard c.end <= ns.length else { return "" }

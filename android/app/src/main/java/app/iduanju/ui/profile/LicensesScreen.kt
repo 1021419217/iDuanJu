@@ -26,8 +26,13 @@ fun LicensesScreen(onBack: () -> Unit) {
             RowDivider()
             License("QuickJS", "MIT License", "插件运行时（经 QuickJS 包装库），沙箱封装为本应用代码。")
             RowDivider()
+            License("Rhino 1.7.15", "Mozilla Public License 2.0", "小说书源脚本引擎，未修改；来源 github.com/mozilla/rhino，许可随安装包 assets/licenses 分发。")
+            RowDivider()
             License("hongguo-open-player", "GPL-3.0-only · zfdang (commit 3f687c5)",
                 "红果播放签名（Argus 551 / Ladon）参考其 src/server/native/argus.js 移植，与 iOS 实现逐字节一致。")
+            RowDivider()
+            License("红果当前播放器签名", "Apache-2.0 变换来源 · OpenHongguo 05aa580 / gateway 0613b49",
+                "当前 Medusa 封装移植自 get_video_streaming，KS/自定义变换源自 OpenHongguo，已按原生合成向量验证。源码、修改范围和许可见仓库 THIRD_PARTY_NOTICES.md。")
             RowDivider()
             License("UAV-Downloader · yt-dlp · JMComic-Crawler-Python", "Apache-2.0 · Unlicense · MIT",
                 "部分站点解析与 18comic 图片还原算法参考这些项目，代码为独立实现。")

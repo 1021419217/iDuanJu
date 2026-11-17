@@ -23,19 +23,12 @@ actor HuangguoClient {
     static let shared = HuangguoClient()
 
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Mobile/15E148 Safari/604.1"
-    /// 黄果线路是「随机子域 + 固定主域」：换线路时子域整批被摘解析（DNS 直接不响应），
-    /// 主域长期不变。2026-11-13 实测 *.adihsppe.cc / *.ediayikma.cc / huangguoai.com 全部失联，
-    /// 当前真线路是入口页 data-url 公布的 *.dmsbazvt.cc（也见过 ephxeyaj / gitiecgad）。
-    /// 内置列表只放稳定的主域入口当种子，随机子域一律靠入口页动态发现，写死会随换线路失效。
-    static let aiMirrors = ["https://huangguoai.io", "https://huangguoai.me", "https://huangguoai.ai",
-                            "https://huangguoai.com", "https://hgai14.com", "https://hgai12.com",
-                            "https://00b4b.adihsppe.cc", "https://bsl8m.adihsppe.cc", "https://brma.adihsppe.cc",
-                            "https://mzofzp.adihsppe.cc", "https://rpb7bz.adihsppe.cc", "https://v2tg.adihsppe.cc",
+    /// AI site mirrors (2026-11: old *.ediayikma.cc now 301 → *.adihsppe.cc; huangguoai.com is unreachable from
+    /// mainland networks). More are discovered from the site's /go-home/ page and persisted.
+    static let aiMirrors = ["https://00b4b.adihsppe.cc", "https://bsl8m.adihsppe.cc", "https://hgai12.com",
+                            "https://brma.adihsppe.cc", "https://mzofzp.adihsppe.cc", "https://rpb7bz.adihsppe.cc", "https://v2tg.adihsppe.cc",
+                            "https://huangguoai.com", "https://huangguoai.io", "https://huangguoai.me", "https://huangguoai.ai",
                             "https://thu.agdkczeyx.cc", "https://ttvoij.ediayikma.cc"]
-    /// 固定入口页：站方持续在这里用 data-url 公布当前线路。整组线路失效时抓一次即可自愈，
-    /// 不需要跟着发版。对齐全剧 provider_huangguo_domain.go 的 huangguoEntryPages。
-    static let aiEntryPages = ["https://hgai14.com", "https://hgai12.com",
-                               "https://huangguoai.pages.dev", "https://huangguoai.ai"]
     static let mirrorsKey = "stv.huangguo.aiMirrors"
     static let baseKey = "stv.huangguo.aiBase"
     static let videoBase = "https://huangguo.video"
@@ -69,19 +62,39 @@ actor HuangguoClient {
 
     // MARK: HTTP
 
-    /// Pure network call: reads no actor state (session/userAgent are `let`), so it can be called
-    /// from concurrent tasks. Needed because one episode resolves up to 4 variants in parallel.
-    private nonisolated func fetch(_ url: String, referer: String, headers: [String: String] = [:]) async throws -> Data {
+    private func fetch(_ url: String, referer: String, headers: [String: String] = [:]) async throws -> Data {
         guard let u = URL(string: url) else { throw ProviderError.invalid("bad url") }
-        var r = URLRequest(url: u, timeoutInterval: 8)
-        r.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+        var r = URLRequest(url: u)
+        r.setValue(Self.userAgent(for: u), forHTTPHeaderField: "User-Agent")
         r.setValue(referer, forHTTPHeaderField: "Referer")
         r.setValue("zh-CN,zh;q=0.9", forHTTPHeaderField: "Accept-Language")
         for (k, v) in headers { r.setValue(v, forHTTPHeaderField: k) }
         let (d, resp) = try await session.data(for: r)
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let http = resp as? HTTPURLResponse
+        let code = http?.statusCode ?? 0
+        if let e = Self.challengeError(url: u, status: code, headers: http?.allHeaderFields ?? [:], body: d) {
+            SiteLog.add("[黄果] Cloudflare \(code) \(url) · UA \(SiteLog.shortUA(Self.userAgent(for: u))) · cookies \(CFCookies.names(for: url).joined(separator: ","))")
+            throw e
+        }
         guard (200..<300).contains(code) else { throw ProviderError.upstream("HTTP \(code)") }
         return d
+    }
+
+    /// huangguo.video sits behind a Cloudflare managed challenge (issue #12). The user passes it once in the
+    /// visible `SiteVerifySheet`; `cf_clearance` is bound to that WebView's UA, so requests to the site's
+    /// hosts must send the learned UA (other huangguo hosts keep the default).
+    static func userAgent(for url: URL) -> String {
+        guard let host = url.host, cfHosts.contains(where: { CFCookies.domain($0, matches: host) }) else { return userAgent }
+        return SiteUA.learned(.huangguo) ?? userAgent
+    }
+    static var cfHosts: [String] { [URL(string: videoBase)?.host ?? "huangguo.video"] }
+
+    /// Non-nil for a Cloudflare interstitial: becomes 「需要验证」 with 去验证 / 重试 instead of a plain failure.
+    /// The verify target is the site root, where the user completes the check in the WebView.
+    static func challengeError(url: URL, status: Int, headers: [AnyHashable: Any], body: Data) -> SiteError? {
+        let text = String(decoding: body.prefix(64_000), as: UTF8.self)
+        guard CFDetect.isChallenge(status: status, headers: headers, body: text) else { return nil }
+        return .needsVerification(.huangguo, "\(url.scheme ?? "https")://\(url.host ?? "")/")
     }
     private func text(_ url: String, referer: String, ttl: TimeInterval = 300) async throws -> String {
         if let (t, s) = textCache[url], Date().timeIntervalSince(t) < ttl { return s }
@@ -99,106 +112,48 @@ actor HuangguoClient {
         return out
     }
 
-    /// 从入口页/发布页 HTML 里抽线路：既认老的 data-url="https://xxx.dmsbazvt.cc"，
-    /// 也认正文里裸出现的线路域名。主域白名单覆盖历次换线路用过的固定主域。
-    /// 注意：入口页本身（hgai12.com / hgai14.com）是「发布页」，首页 200 但 API 全 404，
-    /// 绝不能当线路用，所以这里只收随机子域线路，不收入口页 host。
+    /// Mirror origins listed on a /go-home/ (发布页) page: same-site hosts only (huangguoai.* / *.adihsppe.cc / hgai*.com).
     static func discoveredMirrors(_ html: String) -> [String] {
         var out: [String] = []
-        func add(_ raw: String) {
-            // 统一规范化成 https://host，避免 data-url 带路径/尾斜杠把后续 URL 拼坏。
-            guard let comp = URLComponents(string: raw), let h = comp.host, !h.isEmpty,
-                  Self.isLineHost(raw) else { return }
-            let o = "https://" + h.lowercased()
+        for m in HTML.all("https://((?:[a-z0-9-]+\\.)?(?:adihsppe\\.cc|huangguoai\\.(?:com|io|me|ai)|hgai\\d*\\.com))(?=[/\"'\\s<])", html) {
+            let o = "https://" + m[1]
             if !out.contains(o) { out.append(o) }
-        }
-        // 优先 data-url（站方公布当前线路的地方）
-        for m in HTML.all("data-url\\s*=\\s*[\"'](https?://[^\"'\\s>]+)", html) { add(m[1]) }
-        // 兜底：正文里出现的线路域名
-        for m in HTML.all("https://([a-z0-9-]+\\.(?:dmsbazvt|ephxeyaj|gitiecgad|adihsppe|ediayikma|agdkczeyx)\\.cc)(?=[/\"'\\s<])", html) {
-            add("https://" + m[1])
         }
         return out
     }
 
-    /// 只接受「随机子域 + 固定线路主域」的 host，排除入口页、CDN、封面图等。
-    static func isLineHost(_ u: String) -> Bool {
-        guard let h = URL(string: u)?.host?.lowercased() else { return false }
-        let mains = ["dmsbazvt.cc", "ephxeyaj.cc", "gitiecgad.cc", "adihsppe.cc", "ediayikma.cc", "agdkczeyx.cc"]
-        return mains.contains { h.hasSuffix("." + $0) }
-    }
-
-    /// 一条线路是否真的能当 API 用：打一次最小搜索接口，确认返回 data.engine（或 items）非空。
-    /// 只看首页会被「发布页」骗——旧域名/入口页常常还能返回落地页，但 /api/search 与
-    /// /api/videos/.../playback 已经 404，选它当 base 就是「列表能看、点播放失败」。
+    /// One mirror probe: GET / (redirects followed) and keep the FINAL origin so later POSTs don't hit a 301.
     private func probe(_ m: String) async -> (String, String)? {
-        guard let u = URL(string: m + "/api/search?q=%E7%9F%AD%E5%89%A7&page=1&size=1") else { return nil }
+        guard let u = URL(string: m + "/") else { return nil }
         var r = URLRequest(url: u, timeoutInterval: 8)
         r.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-        r.setValue("application/json", forHTTPHeaderField: "Accept")
-        guard let (d, resp) = try? await session.data(for: r),
-              let http = resp as? HTTPURLResponse, http.statusCode == 200,
-              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-              let envData = obj["data"] as? [String: Any] else { return nil }
-        let engine = (envData["engine"] as? String) ?? ""
-        let items = envData["items"] as? [Any]
-        guard !engine.isEmpty || (items?.isEmpty == false) else { return nil }
+        guard let (d, resp) = try? await session.data(for: r), let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+        let body = String(decoding: d, as: UTF8.self)
+        guard body.contains("hg-drama-card") || body.contains("videoInitialData") || body.contains("/ai-duanju/") else { return nil }
         let f = http.url ?? u
-        return ("\(f.scheme ?? "https")://\(f.host ?? u.host ?? "")", "")
+        return ("\(f.scheme ?? "https")://\(f.host ?? u.host ?? "")", body)
     }
 
-    /// 抓一个入口页，返回其中 data-url 公布的线路。actor 方法，供 withTaskGroup 用 await 调用，
-    /// 避免闭包跨边界直接读隔离属性 session 触发 Swift 6 严格并发告警。
-    private func entryLines(_ page: String) async -> [String] {
-        guard let u = URL(string: page + "/") else { return [] }
-        var r = URLRequest(url: u, timeoutInterval: 8)
-        r.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-        guard let (d, resp) = try? await session.data(for: r),
-              (resp as? HTTPURLResponse)?.statusCode == 200 else { return [] }
-        return Self.discoveredMirrors(String(decoding: d, as: UTF8.self))
-    }
-
-    /// 并发抓取固定入口页，返回站方当前公布的线路（去重、限量）。
-    private func currentLines() async -> [String] {
-        var out: [String] = []
-        await withTaskGroup(of: [String].self) { g in
-            for p in Self.aiEntryPages { g.addTask { await self.entryLines(p) } }
-            for await found in g {
-                for o in found where !out.contains(o) { out.append(o) }
-            }
-        }
-        return Array(out.prefix(12))
-    }
-
-    /// 竞速探测一组候选，第一个能用接口应答的胜出。
-    private func race(_ cands: [String]) async -> (String, String)? {
-        await withTaskGroup(of: (String, String)?.self) { g in
+    /// Races all mirrors (first valid wins), remembers the winner and learns new mirrors from /go-home/.
+    private func ensureAIBase() async throws -> String {
+        if let b = aiBase { return b }
+        let cands = Self.mirrorCandidates()
+        let won: (String, String)? = await withTaskGroup(of: (String, String)?.self) { g in
             for m in cands { g.addTask { await self.probe(m) } }
             for await r in g { if let r { g.cancelAll(); return r } }
             return nil
         }
-    }
-
-    /// 选一个真正能用的 API base：先竞速已知候选；整组都失效时去入口页抓当前线路再竞速一轮，
-    /// 这样站方换线路后无需发版即可自愈。全程在当前 actor 上同步完成，不派发后台任务
-    /// （iOS 17 兼容包历史上被 detached 后台任务拖崩过）。
-    private func ensureAIBase() async throws -> String {
-        if let b = aiBase { return b }
-        var cands = Self.mirrorCandidates()
-        var won = await race(cands)
-        if won == nil {
-            let lines = await currentLines()
-            if !lines.isEmpty {
-                // 入口页公布的线路存起来，下次冷启动直接用，不必每次都刷入口页。
-                UserDefaults.standard.set(lines, forKey: Self.mirrorsKey)
-                cands = lines
-                won = await race(lines)
-            }
-        }
-        guard let (base, _) = won else { throw ProviderError.upstream("黄果 AI 站线路均不可用（\(cands.count) 个）") }
+        guard let (base, _) = won else { throw ProviderError.upstream("黄果 AI 站镜像均不可用（\(cands.count) 个）") }
         aiBase = base
         UserDefaults.standard.set(base, forKey: Self.baseKey)
+        Task { await self.learnMirrors(base) }
         return base
+    }
+
+    private func learnMirrors(_ base: String) async {
+        guard let h = try? await text(base + "/go-home/", referer: base + "/", ttl: 3600) else { return }
+        let found = Self.discoveredMirrors(h)
+        if !found.isEmpty { UserDefaults.standard.set(Array(found.prefix(24)), forKey: Self.mirrorsKey) }
     }
 
     // MARK: Lists
@@ -262,7 +217,7 @@ actor HuangguoClient {
         guard !needle.isEmpty else { return [] }
         let enc = q.trimmingCharacters(in: .whitespaces).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? needle
         var groups: [[HGSeries]] = [[], [], []]
-        var errors: [String] = []
+        var errors: [Error] = []
         await withTaskGroup(of: (Int, Result<[HGSeries], Error>).self) { g in
             g.addTask { (0, await Self.attempt {
                 let page = Self.videoBase + "/search?q=" + enc
@@ -291,13 +246,14 @@ actor HuangguoClient {
                 return out.filter { $0.title.lowercased().contains(needle) }
             }) }
             for await (i, r) in g {
-                switch r { case .success(let s): groups[i] = s; case .failure(let e): errors.append(e.localizedDescription) }
+                switch r { case .success(let s): groups[i] = s; case .failure(let e): errors.append(e) }
             }
         }
         var seen = Set<String>()
         // Same rule as Android HuangguoClient.blocked: never return minors / non-consent titles.
         let hits = groups.joined().filter { !Self.blocked($0) && seen.insert($0.id).inserted }
-        if hits.isEmpty, errors.count == groups.count, let e = errors.first { throw ProviderError.upstream(e) }
+        if hits.isEmpty, let v = errors.first(where: { $0.verifyTarget != nil }) { throw v }
+        if hits.isEmpty, errors.count == groups.count, let e = errors.first { throw ProviderError.upstream(e.localizedDescription) }
         return hits
     }
 
@@ -381,6 +337,8 @@ actor HuangguoClient {
             }
         case .video:
             referer = Self.videoBase + "/"
+            headers["User-Agent"] = Self.userAgent(for: URL(string: Self.videoBase)!)
+            keyFetchHeaders = headers
             if media.isEmpty, let p = episode.page { media = dataHLS(try await text(p, referer: referer, ttl: 30), p) ?? "" }
         case .legacy:
             let a = try await legacyAccess()
@@ -401,46 +359,21 @@ actor HuangguoClient {
             return HGResolvedVideo(vid: episode.vid, url: media, key: nil, duration: nil, expiresAt: nil, err: nil, streams: [s])
         }
         let master = String(decoding: try await fetch(media, referer: referer, headers: headers), as: UTF8.self)
-        if !master.isEmpty { HLSPlayback.seed(media, master) }
         var targets: [(String, HLSPlaylist.Variant?)] = [(media, nil)]
         let vars = HLSPlaylist.variants(master, media)
         if !vars.isEmpty { targets = vars.map { ($0.url, $0) } }
         var streams: [HGStream] = []
         var duration: Double?
-        // 之前这里是串行 for 循环：4 个清晰度 × (子 playlist + key) = 最多 8 个 HTTP 往返排队，
-        // 真机上就是「点开先转圈 20–30 秒」。App 源只有一路 m3u8，2 个往返，所以几乎秒开。
-        // 改成并发后总耗时 ≈ 最慢的那一个往返；fetch 是 nonisolated 纯网络，没有共享状态。
-        // 只解析前 2 个清晰度：真机上 4 路并发会被代理按 host 限速，反而比 2 路慢；
-        // 短视频站本来也用不到 4 档。剩下的一档由播放器按带宽自适应。
-        let batch: [(Int, String, HLSPlaylist.Variant?)] =
-            Array(targets.prefix(2).enumerated()).map { ($0.offset, $0.element.0, $0.element.1) }
-        var resolved: [Int: HGStream] = [:]
-        var dur: Double = 0
-        await withTaskGroup(of: (Int, HGStream, Double).self) { group in
-            for (i, u, v) in batch {
-                group.addTask { [master, referer, headers, keyFetchHeaders] in
-                    let pl = v == nil ? master : String(decoding: (try? await self.fetch(u, referer: referer, headers: headers)) ?? Data(), as: UTF8.self)
-                    // 起播时 AVFoundation 会用 resourceLoader 再拉一次同一个 URL；把原文交给它，
-                    // 能省掉一次完整往返（代理环境 1–2 秒）。
-                    if !pl.isEmpty { HLSPlayback.seed(u, pl) }
-                    let k = HLSPlaylist.keys(pl, u)
-                    var keyHex = ""
-                    if k.encrypted, !k.uri.isEmpty, let d = try? await self.fetch(k.uri, referer: referer, headers: keyFetchHeaders) {
-                        keyHex = HLSPlaylist.keyHex(d)
-                    }
-                    let s = HGStream(streamId: "hls\(i)", quality: v.map(HLSPlaylist.quality) ?? "source", url: u, key: keyHex,
-                                     width: v?.width, height: v?.height, bitrate: v?.bandwidth,
-                                     kind: k.encrypted ? .hlsAES : .hls, headers: headers)
-                    return (i, s, HLSPlaylist.duration(pl))
-                }
-            }
-            for await (i, s, d) in group {
-                resolved[i] = s
-                if dur == 0, d > 0 { dur = d }
-            }
+        for (i, (u, v)) in targets.prefix(4).enumerated() {
+            let pl = v == nil ? master : String(decoding: (try? await fetch(u, referer: referer, headers: headers)) ?? Data(), as: UTF8.self)
+            let k = HLSPlaylist.keys(pl, u)
+            var keyHex = ""
+            if k.encrypted, !k.uri.isEmpty, let d = try? await fetch(k.uri, referer: referer, headers: keyFetchHeaders) { keyHex = HLSPlaylist.keyHex(d) }
+            if duration == nil { let d = HLSPlaylist.duration(pl); if d > 0 { duration = d } }
+            streams.append(HGStream(streamId: "hls\(i)", quality: v.map(HLSPlaylist.quality) ?? "source", url: u, key: keyHex,
+                                    width: v?.width, height: v?.height, bitrate: v?.bandwidth,
+                                    kind: k.encrypted ? .hlsAES : .hls, headers: headers))
         }
-        for i in 0..<batch.count { if let s = resolved[i] { streams.append(s) } }
-        if dur > 0 { duration = dur }
         let note = streams.contains { $0.kind == .hlsAES && $0.key.isEmpty } ? "加密 HLS 未能取到密钥" : nil
         return HGResolvedVideo(vid: episode.vid, url: streams.first?.url, key: streams.first?.key, duration: duration,
                                expiresAt: nil, err: nil, streams: streams, note: note)

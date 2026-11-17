@@ -5,8 +5,6 @@ struct STVApp: App {
     @UIApplicationDelegateAdaptor(OrientationGate.self) private var orientation
     init() {
         CFSolver.install()
-        // iOS 17 兼容：不再启动全局后台主线程看门狗。它从后台线程写站点日志，
-        // 与主线程日志并发时共享的 DateFormatter 会崩溃；长信号量等待还会拖死播放主线程。
         // Load plugin / 采集站 indexes before anything reads `Sites.all` or `SourceGate`.
         MainActor.assumeIsolated { _ = CMSStore.shared; _ = PluginStore.shared }
     }
@@ -118,7 +116,14 @@ enum DebugRoute {
         case "history": return .history
         case "plugins": return .plugins
         case "sitelog": return .siteLog
-        case "fxplay": return .fixturePlay(arg)
+        case "fxplay":
+            // UI tests run in the simulator sandbox: #filePath points at the host checkout and is not readable.
+            // The Debug-only build phase provides this clearly labelled local color-bar fixture, never Release.
+            if !FileManager.default.fileExists(atPath: arg), arg.hasSuffix("player_landscape.mp4"),
+               let local = Bundle.main.url(forResource: "ui_color_bars", withExtension: "mp4") {
+                return .fixturePlay(local.path)
+            }
+            return .fixturePlay(arg)
         case "tgplay": return .tgPlay(arg)
         case "site", "siteplay", "board":
             let a = arg.split(separator: ":", maxSplits: 1).map(String.init)
@@ -151,9 +156,9 @@ struct DebugRouteHost: View {
         case .siteLog: NavigationStack { SiteLogView().routes() }
         case .fixturePlay(let path):
             NavigationStack {
-                VerticalPlayerView(series: HGSeries(source: .telegram, seriesId: "fixture/1/0", title: ProcessInfo.processInfo.environment["STV_FX_TITLE"] ?? "公开测试流 · 横版 1280×720", cover: "",
+                VerticalPlayerView(series: HGSeries(source: .telegram, seriesId: "fixture/1/0", title: ProcessInfo.processInfo.environment["STV_FX_TITLE"] ?? "本地彩条测试 · 非真实片源", cover: "",
                                                     duration: 60, onlineTime: 1_586_390_400, orientation: "landscape", page: URL(fileURLWithPath: path).absoluteString),
-                                   startIndex: 0).routes()
+                                   startIndex: Int(ProcessInfo.processInfo.environment["STV_FX_START"] ?? "") ?? 0).routes()
             }
         case .tgPlay(let ref):
             NavigationStack { TGPlayRouteHost(ref: ref).routes() }

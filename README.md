@@ -7,14 +7,48 @@
 i短剧 是一个原生 SwiftUI 编写的 iOS 多源短剧 / 视频 / 漫画 / Telegram 频道聚合播放器，另有原生 Kotlin 编写的
 [Android 版](#android-版)。App 本身**不托管任何内容**，所有数据都由你的设备直接向各个公开站点请求。
 
-**下载**：到 [Releases](https://github.com/my-name-is-alan/iDuanJu/releases) 获取 iOS 未签名 IPA 和 Android APK
-（[Android 1.5.2](https://github.com/my-name-is-alan/iDuanJu/releases/tag/v1.5.2-android)）。
+**下载（仅保留以下两个新版）**：
+
+- [Android 1.5.12 发布页](https://github.com/my-name-is-alan/iDuanJu/releases/tag/v1.5.12-ui-android) · [直接下载 APK](https://github.com/my-name-is-alan/iDuanJu/releases/download/v1.5.12-ui-android/iDuanJu-1.5.12-ui-android.apk)
+- [iOS 1.5 build 12 发布页](https://github.com/my-name-is-alan/iDuanJu/releases/tag/v1.5b12-ui) · [直接下载未签名 IPA](https://github.com/my-name-is-alan/iDuanJu/releases/download/v1.5b12-ui/STV-1.5b12-unsigned.ipa)
+
+新版为 UI 重设计版，并包含此前的小说、红果取流与筛选修复。Android 与 1.5.8 使用同一分发签名，可下载 APK 覆盖安装；iOS IPA 需自行重签侧载。请下载 Assets 中的 APK / IPA，SHA-256 见同页附件。
+
+### 2026-11-17 UI 重设计版（iOS 1.5 build 12 / Android 1.5.12）
+
+更新内容见 [发布说明](docs/releases/ui-redesign-1.5b12.md)，验收范围与已知缺口见 [交付记录](docs/ui-redesign-1.5b11.md)。
+
+### 2026-11-17 小说增强版
+
+- 按真实合集 1335 修复发现分组、JS 生成请求、部分脚本与正文兼容，榜单改为顶部分组＋左侧栏目＋封面排名列表。
+- 详情和阅读页加入缓存 / 下载、预取章数设置、同书换源与章节进度接续；已缓存文字可离线读取，失败后可继续下载。
+- 番茄《十日终焉》、书旗《凡人修仙传》的榜单、搜索、目录、前三章正文及离线缓存已实际验证，并修复 Android 设备上的 ICU 正则与 JSON 桥接差异。小说榜单、搜索、书源配置和缓存页统一使用应用蓝色主题及浅深色背景。完整范围见 [本轮验收记录](docs/novel-followup-20261117.md)；图片正文和部分 403 来源仍不支持。
+
+使用：小说 → 书源 → 导入自己的 Legado 合集 → 在榜单顶部选源、左侧选栏目。详情或阅读页进入“下载 / 缓存”，可缓存后 50 / 200 章或全本、调整提前缓存章数；“换源”会查找同名同作者书籍并接续章节。下载时保持应用前台，已缓存文字可离线阅读。本轮用 [合集 1335](https://www.yckceo.com/yuedu/shuyuans/json/id/1335.json) 做测试，不把第三方书源内置到安装包。
+
+以下是原生模拟器中的合成数据布局验收图，真实书源测试结果单独记录：
+
+<img src="docs/screenshots/novel-rank.png" width="280" alt="小说分组榜单布局">
+<img src="docs/screenshots/novel-download.png" width="280" alt="缓存下载和阅读预取设置">
+
+### 2026-11-16 更新
+
+- 红果取流与筛选同步至 gateway `0613b49`：当前 Medusa 播放签名、同身份端点回退与有界换设备；筛选请求独立使用 551，按真人剧 / 漫剧 / AI 剧加载对应面板。上述修复已包含在顶部两个新版中。
+
+- 修复 Actions：Android 使用 Maven Central 镜像、Gradle 缓存和有界重试；iOS 保留完整编译日志并作为 artifact 上传。
+- 苹果 CMS：首页按分类独立分页、刷新完整分类列表、显示上游错误与空分类提示。部分接口的“电影”等父分类本身无资源，请选择“动作片”等子分类。
+- 小说：iOS 新增“发现好书”，读取已导入书源的 `exploreUrl` / `ruleExplore`；支持文本、JSON 和 JS 生成的栏目。
+- Android 新增剧星榜、演员名搜索入口、小说 TXT 阅读、书源导入、搜索、发现栏目、目录、章节阅读与续读；新增预加载开关与 100–2000 MB 缓存设置。
+- Android 修复 CENC 样本描述、IV、全明文子样本、`saiz/saio` 和分片解析；使用已知明文回归测试。修复去广告开关持久化与缓存文件写入检查。
+
+**Android 安装提醒**：1.5.8 起发布包使用固定分发签名。此前版本使用调试签名，如果系统提示签名不一致，需要先保存书源、插件和采集站配置，再卸载旧版后安装。卸载会清除应用本地数据；此后同一分发签名的版本可覆盖更新。
 
 ## 功能
 
 - **内置源**：红果短剧（本地签名、匿名设备）、黄果（AI 短剧 / 视频）、Telegram 频道（网页预览 + 可选 TDLib 登录）
 - **长视频站点**（18+，默认关闭）：MissAV、Jable、SupJav、Hanime1、Pornhub、XVideos、Eporner 等
 - **漫画**：MangaDex、包子漫画，以及 JS 插件（manga18fx / komikindo / 18comic，18+，默认关闭）
+- **小说**：iOS 支持 TXT / EPUB、阅读书源、搜索、发现、阅读进度与朗读；Android 支持 TXT 和部分 Legado 书源。双端支持分组榜单、预取、章节下载、离线阅读与同书换源，兼容范围见下文。
 - **JS 插件系统**：基于 QuickJS 的沙箱，每个插件独立运行、只能访问自己声明且你同意过的域名，cookie / 存储互相隔离，
   不能 `eval`、访问不到本机和内网。支持从网址 / 文件 / 粘贴添加，以及订阅列表。规范见 [`docs/plugins/SPEC_ZH.md`](docs/plugins/SPEC_ZH.md)
 - **苹果 CMS v10 采集站**通用适配（m3u8 / mp4 直链）
@@ -23,6 +57,8 @@ i短剧 是一个原生 SwiftUI 编写的 iOS 多源短剧 / 视频 / 漫画 / T
 - **去广告**：自动剔除 HLS 片源中插播的广告片段（adjump、异域名短片段、AES 片源里的明文短片段等），默认开启，可在设置里关闭
 - **播放器**：自绘控制层、竖屏默认 / 旋转或手动横屏、亮度音量手势、倍速、画质 / 线路切换、选集、弹幕、跳过片头、
   预缓冲、本地 HLS 代理、CENC 解密、Telegram 视频边下边播（TDLib Range 流式）
+- **滑动切集**：横竖屏均可在画面中间 60% 区域上滑下一集、下滑上一集；左侧 20% 调亮度、右侧 20% 调音量，
+  最左侧保留返回手势。锁屏、拖动进度、长按倍速、画中画或打开播放器面板时暂停滑动切集。
 - **Cloudflare 验证**：隐藏 WebView 自动过验证（每个插件独立）
 
 ## 截图
@@ -86,7 +122,7 @@ scripts/package.sh            # 输出到 ./dist/STV-<版本>-unsigned.ipa
 ## Android 版
 
 位于 [`android/`](android/)：原生 **Kotlin + Jetpack Compose + Media3（ExoPlayer）**，插件运行时为 QuickJS，
-目标与 iOS 功能对齐。**minSdk 26（Android 8.0）/ targetSdk 35**。当前版本 **1.5.2**（预发布）。
+目标与 iOS 功能对齐。**minSdk 26（Android 8.0）/ targetSdk 35**。当前版本 **1.5.10**（预发布）。
 
 ```bash
 # 要求 JDK 21 + Android SDK（platform 35）
@@ -95,8 +131,8 @@ cd android
 ./gradlew :core:test        # 离线单元测试
 ```
 
-Releases 里的 APK 用 Android 调试证书签名（未上架任何商店），首次安装需允许「安装未知来源应用」；
-以后换成正式签名的版本需要先卸载再装。
+Releases 中的 APK 使用固定分发签名（未上架任何商店），首次安装需允许“安装未知来源应用”。
+本地未配置签名变量时仍使用调试证书；不能保证覆盖安装 Release 包。
 
 已对齐 iOS：
 
@@ -106,11 +142,23 @@ Releases 里的 APK 用 Android 调试证书签名（未上架任何商店），
 - Telegram 公开频道（t.me 网页预览）+ 屏蔽规则（关键词 / 正则 / 域名、广告识别、隐藏或折叠）
 - 黄果、漫画（MangaDex、包子、插件）；首页频道栏与「频道」面板、多源搜索、继续观看 / 收藏 / 历史
 - 「我的」：成人片源开关（18+ 确认，默认关闭）、去广告、重置设备 / 会话、清缓存
+- 剧星榜：排名、头像、热度、代表作与分页，点击演员进入名字搜索
+- 小说：首页 / 我的 → 小说；文件或粘贴 JSON / URL 导入书源；CSS/Jsoup、JSONPath、部分 XPath / JS 规则；分组榜单、TXT 阅读、章节预取、下载缓存、同书换源与续读（兼容结果见验收记录）
+- 播放设置：下一集预加载开关、播放缓存上限
 
-尚未移植：TDLib 登录与下载管理、漫画离线下载、插件执行超时中断与签名校验、长视频预缓冲设置、Face ID 片源锁。
+仍有差异：小说规则尚未覆盖 Legado 的全部 Java / WebView 能力；Android 尚无 EPUB 文件导入、朗读、演员主页与性别筛选、内置长视频站适配、TDLib 登录与下载管理、漫画离线下载、插件执行超时中断与签名校验、Cloudflare 验证、CENC 边下边解、Face ID 片源锁。小说推荐来自用户导入的书源，不内置推书君、优书网等第三方服务。
 
-**红果取流**：上游会软拒绝从未注册过的本地设备（HTTP 200 空包）。Android 默认每次取流现注册一台一次性匿名设备，
-只用一次，仓库内不附带、不写死任何设备 ID；也可以在「我的」里填入你自己的设备覆盖。
+### Actions 与发布
+
+在 GitHub **Actions → package → Run workflow** 运行双端构建。Android 先运行 `:core:test`，再生成 APK；iOS 默认生成未签名 IPA。勾选 `verify_simulator` 会额外生成本机架构的模拟器 app zip，并运行小说、CMS、CENC 定向测试（TDLib 编译较慢）。构建失败时查看 `ios-build-logs` 和 `android-test-reports` artifacts。
+
+双端发布可运行 **Actions → publish existing packages**，传入已合入 `main` 的成功 package run ID、发布后缀和说明文件。发布任务检查来源、APK 签名及版本、IPA 完整性、包名、平台和版本后上传，并生成 `SHA256SUMS.txt`；默认不覆盖已有 Release。
+
+Android 固定签名使用仓库 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`，别名 `iduanju`；私钥不在仓库中。维护者应保留离线备份，避免更换签名导致覆盖安装失效。
+
+离线测试：`cd android && ./gradlew :core:test`。联网测试需显式 `-Plive=1`；离线通过不代表所有上游站点始终可用。
+
+**红果取流**：两端使用独立匿名注册身份和当前播放器 Medusa 签名，健康身份会复用；单集空包时先用同一身份尝试两个批量端点，全部空包才更换身份，最多 3 次并带冷却。筛选接口独立使用 551 签名。仓库不附带设备 ID 或 SDK token；也可以在“我的”填入自己的设备覆盖。上方新版已包含这些修复。
 
 ## Telegram（TDLib）登录
 
@@ -153,12 +201,12 @@ sandboxed QuickJS plugin system (per-plugin domain allow-list, isolated cookies/
 - Player core: AetherEngine 7.62.0 (LGPL-3.0 with App Store exception, unmodified) with FFmpeg (LGPL-2.1) shipped as replaceable
   dynamic frameworks; automatic AVPlayer fallback; speed capped at 2× by the engine; optional HLS ad-strip (on by default). Sideload the unsigned IPA from `scripts/package.sh`.
 - **Android** (`android/`): native Kotlin + Jetpack Compose + Media3, minSdk 26 / targetSdk 35. Build with JDK 21:
-  `cd android && ./gradlew assembleRelease`. Prebuilt (debug-cert signed) APK on the
-  [Releases](https://github.com/my-name-is-alan/iDuanJu/releases) page. Not yet ported: TDLib login/downloads, manga offline
-  download, plugin timeout/signature checks, long-video precache, Face ID lock.
+  `cd android && ./gradlew assembleRelease`. Download the distribution-signed [Android 1.5.10 APK](https://github.com/my-name-is-alan/iDuanJu/releases/tag/v1.5.10-novel-android)
+  or the [iOS 1.5 build 10 unsigned IPA](https://github.com/my-name-is-alan/iDuanJu/releases/tag/v1.5b10-novel). Not yet ported: TDLib login/downloads, manga offline
+  download, plugin timeout/signature checks, CF verification, streaming CENC and Face ID lock.
+- **Android 1.5.10 / iOS 1.5 build 10**: unified novel themes, Fanqie compatibility, and real-source tests of rankings, search, chapter lists, the first three chapters and offline caches for Fanqie and Shuqi samples. Android still lacks full Legado Java/WebView compatibility, EPUB import and speech.
+- **Signing**: Android releases from 1.5.8 use a persistent distribution key. Older debug-signed builds may require uninstalling first (which clears local data); back up your source configuration before migrating.
 - Telegram login uses **your own** `api_id` / `api_hash` from my.telegram.org; none are bundled.
 - Adult (18+) sources are off by default and require explicit unlock.
 - For personal study only; respect each site's Terms of Service and your local laws.
 - **License: GPL-3.0.** This project is free. **Selling or paid distribution is prohibited**; any derivative work must stay open source under GPL-3.0.
-
-<!-- ci-ping: trigger build after native HLS fixes -->

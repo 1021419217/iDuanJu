@@ -11,8 +11,18 @@ final class PlayerUITests: XCTestCase {
     var isLandscape: Bool { let f = app.windows.firstMatch.frame; return f.width > f.height }
     func waitOrientation(landscape: Bool, timeout: TimeInterval = 6) -> Bool {
         let end = Date().addingTimeInterval(timeout)
-        while Date() < end { if isLandscape == landscape { return true }; Thread.sleep(forTimeInterval: 0.25) }
-        return isLandscape == landscape
+        var stableSince: Date?
+        var previous = CGRect.zero
+        while Date() < end {
+            let frame = app.windows.firstMatch.frame
+            if (frame.width > frame.height) == landscape && frame == previous {
+                if let since = stableSince, Date().timeIntervalSince(since) >= 0.6 { return true }
+                if stableSince == nil { stableSince = Date() }
+            } else { stableSince = nil }
+            previous = frame
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return false
     }
     func shot(_ name: String) {
         let a = XCTAttachment(screenshot: app.screenshot()); a.name = name; a.lifetime = .keepAlways; add(a)
@@ -113,7 +123,10 @@ final class PlayerUITests: XCTestCase {
         // Tap on the bar (no drag) also seeks.
         el("player.progress").coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5)).tap()
         showChrome("player.progress")
-        XCTAssertLessThan(seconds(el("player.progress").value as? String ?? ""), 25, "tap-to-seek failed")
+        // AVPlayer.seek is asynchronous: retain the same <25s requirement, but await its acknowledgement.
+        let sought = NSPredicate { [self] _, _ in seconds(el("player.progress").value as? String ?? "") < 25 }
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: sought, evaluatedWith: bar)], timeout: 3), .completed,
+                       "tap-to-seek failed")
     }
 
     /// Pinch out on the video → 铺满全屏, pinch in → 完整自适应.
@@ -125,7 +138,9 @@ final class PlayerUITests: XCTestCase {
         app.windows.firstMatch.pinch(withScale: 2.2, velocity: 3)
         XCTAssertTrue(waitValue(video, "fill"), "pinch out did not fill: \(video.value ?? "-")")
         shot("pl_07_pinch_fill")
-        app.windows.firstMatch.pinch(withScale: 0.45, velocity: -3)
+        // Bound the inward gesture away from iOS's edge strips; Window.pinch starts a finger at an edge on iOS 27.
+        showChrome("player.playPause")
+        el("player.playPause").pinch(withScale: 0.45, velocity: -3)
         XCTAssertTrue(waitValue(video, "fit"), "pinch in did not fit: \(video.value ?? "-")")
     }
 
@@ -179,12 +194,181 @@ final class PlayerUITests: XCTestCase {
 
     // MARK: v3 popovers & orientation (4-part test-pattern long video, chrome pinned)
 
-    static let icons = ["player.rate", "player.quality", "player.episodes", "player.fullscreen"]
+    static let icons = ["player.episodes", "player.rate", "player.quality", "player.danmaku",
+                        "player.audio"]
 
     func launchV3() {
         launch(["STV_FX_EPISODES": "4", "STV_FX_TITLE": "测试图案合集", "STV_KEEP_CHROME": "1"])
         XCTAssertTrue(el("player.progress").waitForExistence(timeout: 20), "player did not become ready")
     }
+
+    private func assertEpisode(_ number: Int, file: StaticString = #filePath, line: UInt = #line) {
+        let end = Date().addingTimeInterval(8)
+        while Date() < end, el("player.title").value as? String != "第\(number)集" { Thread.sleep(forTimeInterval: 0.2) }
+        XCTAssertEqual(el("player.title").value as? String, "第\(number)集", "expected episode \(number)", file: file, line: line)
+        XCTAssertTrue(el("player.progress").waitForExistence(timeout: 20),
+                      "selected episode did not become ready", file: file, line: line)
+    }
+
+    func testSideAdjustmentsWhileEpisodeIsLoadingOrFailed() {
+        for fail in [false,true] {
+            launch(["STV_FX_EPISODES":"4", "STV_KEEP_CHROME":"1", "STV_PLAYER_LOAD_DELAY":"4", "STV_PLAYER_LOAD_ERROR":fail ? "1" : "0"])
+            XCTAssertTrue(el("player.loading").waitForExistence(timeout:10))
+            XCUIDevice.shared.orientation = .landscapeLeft
+            XCTAssertTrue(waitOrientation(landscape:true))
+            for x: CGFloat in [0.12,0.88] { swipeEpisode(next:true,x:x) }
+            XCTAssertEqual(el("player.episodeInfo").value as? String,"第1集")
+            if fail {
+                XCTAssertTrue(app.buttons["重试"].waitForExistence(timeout:10))
+                for x: CGFloat in [0.12,0.88] { swipeEpisode(next:true,x:x) }
+                XCTAssertEqual(el("player.episodeInfo").value as? String,"第1集")
+            } else { assertEpisode(1) }
+            app.terminate()
+        }
+    }
+
+    func testNaturalEndStartsNextEpisodeOnBothEngines() {
+        for engine in ["avplayer","aether"] {
+            launch(["STV_FX_EPISODES":"4", "STV_KEEP_CHROME":"1", "STV_ENGINE":engine, "STV_SEEK":"58"])
+            XCTAssertTrue(el("player.progress").waitForExistence(timeout:30))
+            assertEpisode(2)
+            let before = seconds(el("player.progress").value as? String ?? "")
+            Thread.sleep(forTimeInterval:2)
+            let after = seconds(el("player.progress").value as? String ?? "")
+            XCTAssertGreaterThan(after,before,"next episode must actually play on \(engine)")
+            app.terminate()
+        }
+    }
+
+    private func swipeEpisode(next: Bool, x: CGFloat = 0.5) {
+        let window = app.windows.firstMatch
+        // Cross half a page deliberately. The previous 45% drag relied on UIKit's end-velocity
+        // estimate and could correctly snap back under simulator load instead of changing episode.
+        window.coordinate(withNormalizedOffset: CGVector(dx: x, dy: next ? 0.65 : 0.35))
+            .press(forDuration: 0.05, thenDragTo:
+                window.coordinate(withNormalizedOffset: CGVector(dx: x, dy: next ? 0.1 : 0.9)))
+        // Wait for the native scroll phase, not a fixed 500ms that can interrupt the previous bounce under load.
+        let idle = NSPredicate(format: "value == %@", "idle")
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: idle, evaluatedWith: el("player.feed"))], timeout: 6), .completed,
+                       "episode paging did not settle before the next gesture")
+    }
+
+    func testLandscapeEpisodePagingAndRotation() {
+        launchV3()
+        assertEpisode(1)
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertTrue(waitOrientation(landscape: true))
+        assertEpisode(1)
+        swipeEpisode(next: false)
+        assertEpisode(1) // the first page must not wrap to the last
+        swipeEpisode(next: true)
+        assertEpisode(2)
+        shot("landscape_swipe_episode_2")
+        XCUIDevice.shared.orientation = .portrait
+        XCTAssertTrue(waitOrientation(landscape: false))
+        assertEpisode(2)
+        XCUIDevice.shared.orientation = .landscapeRight
+        XCTAssertTrue(waitOrientation(landscape: true))
+        assertEpisode(2)
+        swipeEpisode(next: false)
+        assertEpisode(1)
+        for episode in 2...4 {
+            swipeEpisode(next: true)
+            assertEpisode(episode)
+        }
+        swipeEpisode(next: true)
+        assertEpisode(4) // the last page must not wrap
+    }
+
+    func testLandscapeSideAdjustmentsAndLockDoNotChangeEpisode() {
+        launchV3()
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertTrue(waitOrientation(landscape: true))
+        for x: CGFloat in [0.12, 0.88] {
+            swipeEpisode(next: true, x: x)
+            assertEpisode(1)
+        }
+        el("player.lock").tap()
+        swipeEpisode(next: true)
+        el("player.video").tap() // reveal the unlock button if the chrome hid
+        el("player.unlock").tap()
+        assertEpisode(1)
+        swipeEpisode(next: true)
+        assertEpisode(2)
+    }
+
+    // MARK: Always-on title / progress, quiet episode switches
+
+    /// Waits for the auto-hiding chrome to go away, then checks the always-on parts survived.
+    private func assertOnlyTitleAndProgressRemain(file: StaticString = #filePath, line: UInt = #line) {
+        let gone = NSPredicate(format: "hittable == false")
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: gone, evaluatedWith: el("player.episodes"))], timeout: 8), .completed,
+                       "auto-hiding chrome did not hide", file: file, line: line)
+        XCTAssertFalse(el("player.playPause").exists, "centre controls must auto-hide", file: file, line: line)
+        XCTAssertTrue(el("player.title").exists && el("player.title").isHittable, "title must stay visible", file: file, line: line)
+        XCTAssertTrue(el("player.progress").exists && el("player.progress").isHittable, "progress bar must stay visible", file: file, line: line)
+    }
+
+    /// Polls `seconds` long: the centre ⟲10 / ▶ / ⟳10 group must never appear.
+    private func assertCenterStaysHidden(for seconds: TimeInterval, _ why: String, file: StaticString = #filePath, line: UInt = #line) {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            XCTAssertFalse(el("player.playPause").exists, why, file: file, line: line)
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+    }
+
+    func testTitleAndProgressStayVisibleAndSwipeKeepsCenterHidden() {
+        launch(["STV_FX_EPISODES": "4", "STV_PLAYER_LOAD_DELAY": "1.5"])
+        XCTAssertTrue(el("player.progress").waitForExistence(timeout: 20), "player did not become ready")
+        assertEpisode(1)
+        assertOnlyTitleAndProgressRemain()
+        shot("ux_title_progress_always_on")
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertTrue(waitOrientation(landscape: true))
+        swipeEpisode(next: true)
+        assertCenterStaysHidden(for: 5, "episode swipe must not pop the centre controls")
+        assertEpisode(2)
+        XCTAssertTrue(el("player.title").exists, "title must stay visible after a switch")
+        // An explicit tap still brings the full controls back.
+        showChrome("player.playPause")
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertTrue(waitOrientation(landscape: true))
+        // Even locked (including after the unlock affordance auto-hides), title/progress remain.
+        showChrome("player.lock"); el("player.lock").tap()
+        Thread.sleep(forTimeInterval: 4)
+        XCTAssertTrue(el("player.title").exists && el("player.progress").exists)
+        XCTAssertFalse(el("player.playPause").exists)
+        shot("ux_landscape_locked_title_progress")
+    }
+
+    func testEpisodePanelPickKeepsCenterHidden() {
+        launch(["STV_FX_EPISODES": "4"])
+        XCTAssertTrue(el("player.progress").waitForExistence(timeout: 20), "player did not become ready")
+        showChrome("player.episodes"); el("player.episodes").tap()
+        let pick = el("player.ep.3")
+        XCTAssertTrue(pick.waitForExistence(timeout: 5), "episode panel did not list episode 3")
+        pick.tap()
+        assertCenterStaysHidden(for: 5, "picking from the episode panel must not pop the centre controls")
+        assertEpisode(3)
+        shot("ux_switched_episode_3_no_center_local_color_bars")
+    }
+
+    func testAutoplayAdvanceKeepsCenterHidden() {
+        // STV_PANEL_DELAY pushes the screenshot hook's own flashChrome() past the end of the test.
+        launch(["STV_FX_EPISODES": "4", "STV_SEEK": "52", "STV_PANEL_DELAY": "120"])
+        XCTAssertTrue(el("player.progress").waitForExistence(timeout: 20), "player did not become ready")
+        assertOnlyTitleAndProgressRemain()
+        let end = Date().addingTimeInterval(20)
+        while Date() < end, el("player.title").value as? String != "第2集" {
+            XCTAssertFalse(el("player.playPause").exists, "autoplay advance must not pop the centre controls")
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        XCTAssertEqual(el("player.title").value as? String, "第2集")
+        assertCenterStaysHidden(for: 4, "the next episode becoming ready must not pop the centre controls")
+        XCTAssertTrue(el("player.title").exists && el("player.progress").exists)
+    }
+
     func popoverGone(_ id: String) -> Bool {
         let p = NSPredicate(format: "exists == false")
         return XCTWaiter().wait(for: [expectation(for: p, evaluatedWith: el(id))], timeout: 4) == .completed
@@ -193,10 +377,24 @@ final class PlayerUITests: XCTestCase {
         app.windows.firstMatch.coordinate(withNormalizedOffset: landscape ? CGVector(dx: 0.2, dy: 0.5) : CGVector(dx: 0.85, dy: 0.18)).tap()
     }
 
+    func testShortFixtureEpisodeGrid() {
+        launch(["STV_FX_EPISODES":"48", "STV_FX_SHORT":"1", "STV_FX_START":"35", "STV_KEEP_CHROME":"1", "STV_FILL":"0"])
+        XCTAssertTrue(el("player.progress").waitForExistence(timeout:20))
+        assertEpisode(36)
+        el("player.episodes").tap()
+        XCTAssertTrue(el("player.ep.36").waitForExistence(timeout:4))
+        shot("ux_short_grid_local_color_bars")
+        el("player.ep.37").tap()
+        assertEpisode(37)
+        assertCenterStaysHidden(for:4,"episode grid switch must keep centre hidden")
+    }
+
     func testV3IconsAndPopoversPortrait() {
         launchV3()
         XCTAssertTrue(waitOrientation(landscape: false))
-        // Four equally spaced icons in one row (音轨/字幕/弹幕 now live in the 更多 menu).
+        // Five equally spaced labelled actions in one row; 全屏 closes the progress row.
+        XCTAssertTrue(el("player.fullscreen").waitForExistence(timeout: 4))
+        XCTAssertLessThan(abs(el("player.fullscreen").frame.midY - el("player.remaining").frame.midY), 4, "全屏 not on the progress row")
         let frames = Self.icons.map { id -> CGRect in XCTAssertTrue(el(id).waitForExistence(timeout: 4), id); return el(id).frame }
         let ys = frames.map(\.midY), xs = frames.map(\.midX)
         XCTAssertLessThan((ys.max()! - ys.min()!), 2, "icons not on one row")
@@ -238,18 +436,9 @@ final class PlayerUITests: XCTestCase {
         XCTAssertTrue(popoverGone("player.popover.episodes"))
 
         // Only one popover at a time; same icon toggles closed.
-        el("player.quality").tap()
-        XCTAssertTrue(el("player.popover.quality").waitForExistence(timeout: 3))
-        el("player.quality").tap()
-        XCTAssertTrue(popoverGone("player.popover.quality"), "same icon did not toggle closed")
-
-        // 音轨 / 字幕 / 弹幕 moved into the top-right 更多 menu.
-        el("player.more").tap()
-        XCTAssertTrue(el("player.audio").waitForExistence(timeout: 3), "音轨 missing from 更多 menu")
-        XCTAssertTrue(el("player.subtitles").exists, "字幕 missing from 更多 menu")
         el("player.audio").tap()
         XCTAssertTrue(el("player.popover.audio").waitForExistence(timeout: 3))
-        scrimTap(landscape: false)
+        el("player.audio").tap()
         XCTAssertTrue(popoverGone("player.popover.audio"))
     }
 

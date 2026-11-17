@@ -4,26 +4,40 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 android {
+    // Local color-bar fixture is Debug-only; no sample media is added to a Release artifact.
+    sourceSets.getByName("debug").assets.srcDir("../../STVTests/Fixtures")
+
     namespace = "app.iduanju"
     compileSdk = 35
     defaultConfig {
         applicationId = "app.iduanju"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1505
-        versionName = "1.5.5-android"
+        versionCode = 1512
+        versionName = "1.5.12-android"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+    signingConfigs {
+        create("distribution") {
+            val path = System.getenv("ANDROID_KEYSTORE_PATH")
+            if (!path.isNullOrBlank()) {
+                storeFile = file(path)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = "iduanju"
+                keyPassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            }
+        }
     }
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (System.getenv("ANDROID_KEYSTORE_PATH").isNullOrBlank()) "debug" else "distribution")
         }
         debug { }
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures { buildConfig = true; compose = true }
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     // 推荐插件: the same .idjplugin bundles the iOS app ships (STV/Resources/Plugins), copied at build time
     sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/idj-assets"))
@@ -32,7 +46,11 @@ val copyBundledPlugins by tasks.registering(Sync::class) {
     from(rootProject.file("../STV/Resources/Plugins")) { include("*.idjplugin") }
     into(layout.buildDirectory.dir("generated/idj-assets/plugins"))
 }
-tasks.named("preBuild") { dependsOn(copyBundledPlugins) }
+val copySharedLicenses by tasks.registering(Sync::class) {
+    from(rootProject.file("../STV/Resources/Licenses")) { include("HGCurrentPlayer-*", "Rhino-*") }
+    into(layout.buildDirectory.dir("generated/idj-assets/licenses"))
+}
+tasks.named("preBuild") { dependsOn(copyBundledPlugins, copySharedLicenses) }
 dependencies {
     implementation(project(":core"))
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
@@ -56,6 +74,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("wang.harlon.quickjs:wrapper-android:3.2.3")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
     androidTestImplementation(platform("androidx.compose:compose-bom:2024.12.01"))
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

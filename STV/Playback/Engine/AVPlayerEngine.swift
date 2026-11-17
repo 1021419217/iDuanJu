@@ -9,6 +9,8 @@ import UIKit
     let kind = PlayerEngineKind.avplayer
     var onFailed: ((Error?) -> Void)?
     var onEnded: (() -> Void)?
+    var onPlaybackRequested: ((Bool) -> Void)?
+    private let transport = PlayerTransportObserver()
 
     final class Surface: UIView {
         override class var layerClass: AnyClass { AVPlayerLayer.self }
@@ -37,6 +39,8 @@ import UIKit
         view.isUserInteractionEnabled = false
         view.playerLayer.player = player
         view.playerLayer.videoGravity = .resizeAspect
+        transport.bind(player)
+        transport.onRequest = { [weak self] in self?.onPlaybackRequested?($0) }
     }
 
     func supports(_ src: PlaybackCoordinator.Source) -> Bool { true }
@@ -44,15 +48,11 @@ import UIKit
     func load(_ src: PlaybackCoordinator.Source, stream: HGStream?, start: Double?, title: String) async throws {
         generation += 1
         let gen = generation
+        transport.acceptingRequests = false
+        transport.expectPaused(true)
         statusObservation = nil
         guard let item = PlaybackCoordinator.makeItem(src) else { throw URLError(.badURL) }
-        // 直连 HLS（黄果视频站、长视频站）不要等 AVFoundation 把缓冲堆满才开画面：
-        // 默认策略会先囤几秒再播，代理环境下就是「转圈 20 秒」。预缓冲/本地代理路径不受影响。
-        if case .stream = src {
-            // AVPlayerItem 没有 stalling 开关（那是 AVPlayer 的属性），只设向前缓冲：
-            // 默认行为会先囤好几秒才出画面，代理环境下就是「转圈」。
-            item.preferredForwardBufferDuration = 2
-        }
+        item.nowPlayingInfo = [MPMediaItemPropertyTitle: title]
         audioGroup = nil; legibleGroup = nil; audioTracks = []; subtitleTracks = []; selectedAudio = nil; selectedSubtitle = nil
         player.replaceCurrentItem(with: item)
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -77,15 +77,17 @@ import UIKit
             await player.seek(to: CMTime(seconds: start, preferredTimescale: 600))
         }
         if item.status == .failed { throw item.error ?? URLError(.cannotOpenFile) }
+        transport.acceptingRequests = true
         Task { [weak self] in await self?.refreshTracks(item) }
     }
 
     func play(rate: Double) {
+        transport.expectPaused(false)
         player.defaultRate = Float(rate)
         player.play()
     }
 
-    func pause() { player.pause() }
+    func pause() { transport.expectPaused(true); player.pause() }
 
     func setRate(_ rate: Double) {
         player.defaultRate = Float(rate)
@@ -97,6 +99,7 @@ import UIKit
     }
 
     func stop() {
+        transport.acceptingRequests = false
         generation += 1
         statusObservation = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }

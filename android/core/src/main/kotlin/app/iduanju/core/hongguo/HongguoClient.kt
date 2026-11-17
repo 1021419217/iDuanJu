@@ -60,7 +60,6 @@ class HongguoClient(
         private const val URL_BATCH_ABOFF = "https://api5-normal-sinfonlinea.fqnovel.com/novel/player/multi_video_model/v1?"
         private const val URL_DETAIL = "https://api5-normal-sinfonlinea.fqnovel.com/novel/player/multi_video_detail/preload/v1?"
         private const val URL_BOOK_DIR = "https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/directory/all_items/v?"
-        private const val URL_CATEGORY = "https://api5-normal-sinfonlineb.fqnovel.com/reading/distribution/category/landpage/v:version/?"
         const val URL_RANK_CELL = "https://api5-normal-sinfonlinec.fqnovel.com/reading/bookapi/bookmall/cell/change/v:version/?"
         internal const val URL_PLAN = "https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/plan/v?"
         private const val URL_VIDEO_MODEL = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/video_model/v1/"
@@ -375,34 +374,71 @@ class HongguoClient(
         throw lastErr
     }
 
-    // ---- panel / category (list.go) ----
-    @Volatile private var panelCache: Pair<Long, HGPanel>? = null
+    // ---- panel / category (gateway category_transport.go) ----
+    private val panelCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, HGPanel>>()
+    private val categoryPath = "/reading/distribution/category/landpage/v:version/"
 
-    fun panel(): HGPanel {
-        panelCache?.let { (at, p) -> if (nowMs() - at < 600_000) return p }
-        val d = ensureDevice()
-        val u = URL_CATEGORY + "need_selector_panel=true&req_type=only_panel&req_scene=default&" + listQuery(d, nowMs())
-        val data = ok(list(u, method = "POST"), "panel")
+    fun panel(genre: String = ""): HGPanel {
+        require(genre in listOf("", "short_play", "comic_series", "ai_series")) { "未知剧种" }
+        panelCache[genre]?.let { (at, p) -> if (nowMs() - at < 600_000) return p }
+        val data = categoryData(if (genre.isEmpty()) emptyMap() else mapOf("genre" to listOf(genre)), 0, "", emptyList(), true)
         val rows = J.arr(data.opt("selector_rows")).map { r ->
             val rm = J.dict(r)
             HGFilterRow(J.str(rm.opt("type")), J.str(rm.opt("row_name")), J.int(rm.opt("selection_type")),
                 J.arr(rm.opt("items")).map { HGFilterOption(J.str(J.dict(it).opt("selector_item_id")), J.str(J.dict(it).opt("show_name"))) })
         }
-        return HGPanel(rows).also { panelCache = nowMs() to it }
+        return HGPanel(rows).also { panelCache[genre] = nowMs() to it }
     }
 
-    fun category(filterIds: List<String>, offset: Int = 0, sessionId: String? = null): HGPage {
-        val d = ensureDevice()
-        var u = URL_CATEGORY + "offset=$offset&need_selector_panel=false&limit=12&session_id=" + GoURL.queryEscape(sessionId ?: "") +
-            "&client_req_type=3&req_type=only_content"
-        if (filterIds.isNotEmpty()) u += "&filter_ids=" + GoURL.queryEscape(filterIds.joinToString(","))
-        u += "&" + listQuery(d, nowMs())
-        val data = ok(list(u, method = "POST"), "category")
+    fun category(filterIds: List<String>, offset: Int = 0, sessionId: String? = null, seenIds: List<String> = emptyList()): HGPage {
+        val genre = filterIds.firstOrNull { it in listOf("short_play", "comic_series", "ai_series") } ?: ""
+        val selection = categorySelection(panel(genre), filterIds)
+        val data = categoryData(selection, offset, sessionId ?: "", seenIds, false)
         val next = J.int(data.opt("next_offset"))
         val sess = J.str(data.opt("session_id")).ifEmpty { sessionId ?: "" }
         val more = J.bool(data.opt("has_more")) && next > offset && sess.isNotEmpty()
-        val items = J.arr(data.opt("video_data")).map { parseVideoData(J.dict(it)) }
-        return HGPage(items, more, next, null, sess)
+        return HGPage(J.arr(data.opt("video_data")).map { parseVideoData(J.dict(it)) }, more, next, null, sess)
+    }
+
+    private fun categoryData(selection: Map<String, List<String>>, offset: Int, session: String, seen: List<String>, panel: Boolean): JSONObject {
+        val d = ensureDevice()
+        val body = categoryBody(selection, offset, session, seen, panel)
+        val pairs = listQuery(d, 0).split("&").mapNotNull { part ->
+            val i = part.indexOf('='); val key = if (i < 0) part else part.substring(0, i)
+            if (key.isEmpty() || key == "_rticket") null else key to java.net.URLDecoder.decode(if (i < 0) "" else part.substring(i + 1), "UTF-8")
+        }
+        val now = nowMs()
+        val query = HGPlayerSign.encodeQuery(pairs + listOf("ts" to (now / 1000).toString(), "_rticket" to now.toString()))
+        val headers = HGPlaybackSign.headers(query, body, (now / 1000).toUInt(), emptyInstallToken = true).toMutableMap().apply {
+            put("x-ss-req-ticket", now.toString()); put("sdk-version", "2"); put("x-xs-from-web", "0")
+        }
+        val rb = Request.Builder().url("https://api5-normal-sinfonlinea.fqnovel.com$categoryPath?$query").post(body.toRequestBody("application/json; charset=UTF-8".toMediaType()))
+        for ((k, v) in headers) rb.header(k, v)
+        rb.header("User-Agent", UA).header("x-ss-dp", "8662")
+        val j = send(rb.build(), retries = 0)
+        if (J.str(j.opt("code")) != "0") throw ProviderException.upstream("分类 code=${J.str(j.opt("code"))}")
+        return J.dict(j.opt("data"))
+    }
+
+    internal fun categoryBody(selection: Map<String, List<String>>, offset: Int, session: String, seen: List<String>, panel: Boolean): ByteArray {
+        val scene = selection["genre"]?.singleOrNull()?.takeUnless { it == "short_play" } ?: "default"
+        return J.encodeSorted(mapOf(
+            "filter_ids" to seen.joinToString(","), "req_scene" to scene, "offset" to offset, "session_id" to session,
+            "limit" to 12, "need_selector_panel" to panel, "select_items" to selection,
+            "req_type" to if (panel) "only_panel" else "only_content", "client_req_type" to 3,
+        ))
+    }
+
+    internal fun categorySelection(panel: HGPanel, filterIds: List<String>): Map<String, List<String>> {
+        val selection = panel.rows.associate { it.type to mutableListOf<String>() }.toMutableMap()
+        val types = panel.rows.flatMap { row -> row.items.filter { it.id.isNotEmpty() }.map { it.id to row.type } }.toMap()
+        for (id in filterIds.distinct().filter { it.isNotEmpty() }) {
+            val kind = types[id] ?: throw ProviderException.invalid("未知分类筛选 $id")
+            val values = selection.getOrPut(kind) { mutableListOf() }
+            if (panel.rows.firstOrNull { it.type == kind }?.selectType == 2 && values.isNotEmpty()) throw ProviderException.invalid("分类维度 $kind 只能选一个")
+            values += id
+        }
+        return selection
     }
 
     // ---- rank ----
@@ -526,45 +562,30 @@ class HongguoClient(
         return r
     }
 
-    fun resolveFresh(vid: String): HGResolvedVideo {
-        var soft = false
-        val hasOverride = hasPureOverride()
-        // iOS 45d3971: make sure a device_register device exists before video_model (purePlayerIds prefers it).
-        refreshDeviceIfStaleForPlayback()
-        runCatching { ensureDevice() }
-        val pureDid = purePlayerIds().first
-        val (first, firstSoft) = resolvePureLevels(vid, hasOverride)
-        first?.let { return it }
-        soft = firstSoft
-        // Soft reject on the registered device = it went stale upstream. Re-register once and retry instead of
-        // falling through to the legacy dialects (minted devices, soft-rejected anyway).
-        if (soft && reregisterAfterSoftReject(pureDid)) {
-            resolvePureLevels(vid, hasOverride).first?.let { return it }
-        }
-        for (level in listOf(3, 4)) {
+    @Synchronized fun resolveFresh(vid: String): HGResolvedVideo {
+        for (attempt in 0 until 3) {
+            val identity = purePlayerIds()
             try {
-                val r = resolveBatch(vid, level) ?: continue
-                if (r.err == BYTEVC2 && level == 3) continue
-                return r
-            } catch (_: PlayerEmptyBody) {
-                soft = true; System.err.println("[HG] resolveBatch soft-reject level=$level")
-            } catch (e: Exception) {
-                System.err.println("[HG] resolveBatch error level=$level: $e")
+                for (level in listOf(3, 4)) {
+                    var result: HGResolvedVideo? = null
+                    try { result = resolvePure(vid, level, identity) }
+                    catch (_: PlayerEmptyBody) {
+                        for (path in listOf("/novel/player/multi_video_model/v1", "/novel/player/multi_video_model/player/v1")) {
+                            try { result = resolveCurrentBatch(vid, level, identity, path); break } catch (_: PlayerEmptyBody) { }
+                        }
+                    }
+                    val r = result ?: throw PlayerEmptyBody()
+                    if (r.err == BYTEVC2 && level == 3) continue
+                    lastPureRoute = if (hasPureOverride()) "override-current" else "registered-current"
+                    return r
+                }
+            } catch (e: PlayerEmptyBody) {
+                if (hasPureOverride()) throw e
+                playerRejected += identity.did; playerIdentity = null
+                if (attempt == 2) { playerBlockedUntil = nowMs() + 30_000; throw ProviderException.upstream("取流被上游空包拒绝，已尝试 3 个匿名身份，请稍后重试") }
             }
         }
-        for (level in listOf(3, 4)) {
-            try {
-                val r = resolveSingle(vid, level)
-                if (r.err == BYTEVC2 && level == 3) continue
-                return r
-            } catch (e: Exception) {
-                if (e.message?.contains("空响应") == true || e.message?.contains("软拒绝") == true) soft = true
-                System.err.println("[HG] resolveSingle error level=$level: ${e.message}")
-                if (level == 4) break
-            }
-        }
-        if (soft) throw ProviderException.upstream("取流被上游空包拒绝（软拒绝）")
-        throw ProviderException.upstream("取链失败")
+        throw ProviderException.upstream("没有可用播放流")
     }
 
     /** Pure video_model level 3 then 4; an empty body means the device is rejected, so stop there. (result, softRejected) */
@@ -584,14 +605,50 @@ class HongguoClient(
         return null to false
     }
 
-    /** Pure player device: override via HGPlayerDevice.overrideProvider, else local mint (public hygiene). */
-    private fun purePlayerIds(): Pair<String, String> {
-        HGPlayerDevice.overrideProvider?.invoke()?.let { if (it.first.isNotEmpty() && it.second.isNotEmpty()) return it }
-        // iOS 45d3971: video_model only accepts devices that went through device_register (a locally minted
-        // did/iid gets 200 + 0 bytes, a registered one returns video_model). Prefer the registered one.
-        (device ?: HGDevice.load(dataDir))?.let { return it.deviceId to it.iid }
-        val d = HGPlayerDevice.current()
-        return d.deviceId to d.iid
+    private var playerIdentity: HGOneShotDevice.Identity? = null
+    private var playerRegisteredAt = 0L
+    private var playerRejected = mutableSetOf<String>()
+    private var playerBlockedUntil = 0L
+    private var playerTimeOffset = 0L
+    private var playerClockAfter = 0L
+
+    @Synchronized private fun signingMillis(): Long {
+        val sent = nowMs()
+        if (sent >= playerClockAfter) {
+            playerClockAfter = sent + 60_000
+            val clockHttp = playerHttp.newBuilder().callTimeout(5, TimeUnit.SECONDS).followRedirects(false).build()
+            try {
+                clockHttp.newCall(Request.Builder().url("https://$PURE_HOST$PURE_PATH").head().header("Cache-Control", "no-cache").header("User-Agent", PURE_UA).build()).execute().use { response ->
+                    val received = nowMs()
+                    val age = response.header("Age")
+                    if (response.code in 200..499 && received - sent in 0..10_000 && (age == null || age.toLongOrNull() == 0L)) {
+                        val parser = java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", java.util.Locale.US)
+                        parser.timeZone = java.util.TimeZone.getTimeZone("GMT")
+                        response.header("Date")?.let { value -> parser.parse(value)?.let { server ->
+                            playerTimeOffset = server.time + 500 - (sent + received) / 2
+                            playerClockAfter = received + 300_000
+                        } }
+                    }
+                }
+            } catch (_: java.io.IOException) { /* Keep the previous calibration and retry in one minute. */ }
+            catch (_: java.text.ParseException) { /* Invalid Date is not a usable time sample. */ }
+        }
+        return nowMs() + playerTimeOffset
+    }
+
+    @Synchronized private fun ensurePlayerIdentity(failedID: String = ""): HGOneShotDevice.Identity {
+        if (failedID.isNotEmpty()) { playerRejected += failedID; if (playerIdentity?.did == failedID) playerIdentity = null }
+        playerIdentity?.takeIf { it.did !in playerRejected && it.did != failedID && System.currentTimeMillis() - playerRegisteredAt < 7 * 60_000 }?.let { return it }
+        if (System.currentTimeMillis() < playerBlockedUntil) throw ProviderException.upstream("播放器设备注册冷却中，请稍后重试")
+        val id = HGOneShotDevice.register(playerHttp) ?: throw ProviderException.upstream("播放器设备注册失败")
+        playerIdentity = id; playerRegisteredAt = System.currentTimeMillis()
+        return id
+    }
+
+    /** Pure player device: override, else the player-profile registered identity. */
+    private fun purePlayerIds(): HGOneShotDevice.Identity {
+        HGPlayerDevice.overrideProvider?.invoke()?.let { if (it.first.isNotEmpty() && it.second.isNotEmpty()) return HGOneShotDevice.Identity(it.first, it.second, stableUUID("hongguo-player-cdid:" + it.first), Bytes.hex(MessageDigest.getInstance("SHA-256").digest(("hongguo-player-openudid:" + it.first).toByteArray()).copyOfRange(0, 8))) }
+        return ensurePlayerIdentity()
     }
 
     private fun stableUUID(seed: String): String {
@@ -617,22 +674,36 @@ class HongguoClient(
         )
     }
 
-    /**
-     * Signed POST for the pure video_model endpoint, same as iOS `resolvePure`: the exact wire query
-     * (pairs + ts + _rticket) and body are signed with Argus 551 / Ladon only (HGPlaybackSign).
-     * The legacy Gorgon / Medusa / Helios set is soft-rejected here (HTTP 200 + 0 bytes).
-     */
-    private fun pureRequest(body: ByteArray, pairs: List<Pair<String, String>>): Request {
-        val nowMs = nowMs()
-        val ts = (nowMs / 1000).toUInt()
-        val q = HGPlayerSign.encodeQuery(pairs + listOf("ts" to ts.toString(), "_rticket" to nowMs.toString()))
-        val rb = Request.Builder().url("https://$PURE_HOST$PURE_PATH?$q")
+    /** Current six-header player signature; category requests keep their separate 551 dialect. */
+    private fun pureRequest(body: ByteArray, pairs: List<Pair<String, String>>, path: String = PURE_PATH): Request {
+        val nowMs = signingMillis()
+        val (q, headers) = HGCurrentPlayer.sign(pairs, nowMs, pairs.first { it.first == "device_id" }.second, PURE_VN, body)
+        val rb = Request.Builder().url("https://$PURE_HOST$path?$q")
             .post(body.toRequestBody("application/json; charset=UTF-8".toMediaType()))
             .header("Content-Type", "application/json; charset=UTF-8").header("Accept", "application/json")
-        for ((k, v) in HGPlaybackSign.headers(q, body, ts)) if (v.isNotEmpty()) rb.header(k, v)
+        for ((k, v) in headers) if (v.isNotEmpty()) rb.header(k, v)
         rb.header("User-Agent", PURE_UA).header("x-ss-dp", "8662").header("lc", "101")
-            .header("x-reading-request", "$nowMs-${(nowMs * 1_000_000L) and 0x7fffffff}")
+            .header("x-reading-request", "${headers.getValue("x-ss-req-ticket")}-${(nowMs * 1_000_000L) and 0x7fffffff}")
         return rb.build()
+    }
+
+    private fun resolveCurrentBatch(vid: String, level: Int, identity: HGOneShotDevice.Identity, path: String): HGResolvedVideo {
+        val body = J.encodeSorted(mapOf("biz_param" to mapOf("detail_page_version" to 0, "device_level" to level, "disable_digg_stat" to false,
+            "disable_video_relate_book" to false, "need_all_video_definition" to true, "need_mp4_align" to false, "use_os_player" to false,
+            "use_server_dns" to true, "use_server_dns_scene" to "cold_start_stage", "video_platform" to 1024),
+            "dr_scene" to "player", "mixed_video_id_map" to mapOf("1004" to listOf(vid))))
+        val pairs = purePlayerPairs(identity.did, identity.iid, identity.cdid, identity.openudid)
+        playerHttp.newCall(pureRequest(body, pairs, path)).execute().use { response ->
+            if (response.code != 200) throw ProviderException.upstream("multi_video_model HTTP ${response.code}")
+            val bytes = response.body?.bytes() ?: ByteArray(0)
+            if (bytes.isEmpty()) throw PlayerEmptyBody()
+            val j = J.parse(bytes)
+            for (code in listOf(j.opt("code"), J.dict(j.opt("BaseResp")).opt("StatusCode")))
+                if (code != null && J.str(code) != "0") throw ProviderException.upstream("multi_video_model code=${J.str(code)}")
+            val entry = J.dict(J.dict(j.opt("data")).opt(vid))
+            val model = videoModelJSON(entry.opt("video_model")) ?: throw ProviderException.upstream("multi_video_model 缺少请求的分集")
+            return materialize(model, vid)
+        }
     }
 
     /**
@@ -671,15 +742,15 @@ class HongguoClient(
         var last: Exception = PlayerEmptyBody()
         for (attempt in 0 until (if (ids != null) 1 else 2)) {
             if (attempt > 0) Thread.sleep(500)
-            val (did, iid) = ids?.let { it.did to it.iid } ?: purePlayerIds()
+            val identity = ids ?: purePlayerIds()
             try {
-                playerHttp.newCall(pureRequest(body, purePlayerPairs(did, iid, ids?.cdid, ids?.openudid))).execute().use { resp ->
+                playerHttp.newCall(pureRequest(body, purePlayerPairs(identity.did, identity.iid, identity.cdid, identity.openudid))).execute().use { resp ->
                     val status = resp.code
                     val data = resp.body?.bytes() ?: ByteArray(0)
                     if (status == 429 || status >= 500) { last = ProviderException.upstream("video_model HTTP $status"); return@use }
                     if (status != 200) throw ProviderException.upstream("video_model HTTP $status")
                     if (data.isEmpty()) {
-                        System.err.println("[HG] resolvePure HTTP 200 empty level=$level did=$did bytes=0")
+                        System.err.println("[HG] resolvePure HTTP 200 empty level=$level bytes=0")
                         throw PlayerEmptyBody()
                     }
                     val j = J.parse(data)
@@ -689,7 +760,7 @@ class HongguoClient(
                     val raw = videoModelJSON(J.dict(j.opt("data")).opt("video_model"))
                         ?: throw ProviderException.upstream("video_model 缺失")
                     val r = materialize(raw, vid)
-                    System.err.println("[HG] resolvePure ok level=$level streams=${r.streams.size} did=$did")
+                    System.err.println("[HG] resolvePure ok level=$level streams=${r.streams.size}")
                     return r
                 }
             } catch (e: PlayerEmptyBody) { throw e }   // device rejected: retrying the same device only burns a request

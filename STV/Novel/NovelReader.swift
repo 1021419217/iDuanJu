@@ -149,7 +149,7 @@ struct NovelPagedView: UIViewControllerRepresentable {
 /// Reader after WeRead (iOS): chapter name top-left, page number bottom-right, interactive page turning,
 /// tap the middle or swipe up for the toolbar (目录 · 书籍 · 进度 · 亮度 · 字体) and 听书.
 struct NovelReaderView: View {
-    let book: NovelBook
+    @State private var book: NovelBook
     private let store = NovelStore.shared
     @State private var prefs = NovelPrefs.shared
     @State private var fonts = NovelFonts.shared
@@ -173,10 +173,12 @@ struct NovelReaderView: View {
     @State private var tocSearch = false
     @State private var query = ""
     @State private var hits: [(chapter: Int, offset: Int, snippet: String)] = []
+    @State private var showDownloads = false
+    @State private var showSources = false
     enum Tab: Equatable { case toc, info, progress, light, font, fonts, turn, listen }
 
     init(book: NovelBook) {
-        self.book = book
+        _book = State(initialValue: book)
         _paginator = State(initialValue: NovelPaginator(book: book))
     }
 
@@ -229,8 +231,24 @@ struct NovelReaderView: View {
                 }
             }
             .onChange(of: layoutKey(geo)) { _, _ in relayout(geo) }
+            .onChange(of: book.id) { _, _ in configure(geo); restore(); if book.isWeb { loader.prefetch(book, around: ref.chapter) } }
         }
         .statusBarHidden(!menu)
+        .sheet(isPresented: $showDownloads) { NovelDownloadView(book: book, chapter: ref.chapter) }
+        .sheet(isPresented: $showSources) {
+            if let sourceURL = book.sourceURL, let bookURL = book.bookURL {
+                NavigationStack {
+                    NovelWebDetailView(items: [LegadoSearchItem(name: book.title, author: book.author ?? "", kind: "", intro: "", cover: book.coverURL ?? "", latest: "", bookURL: bookURL, sourceURL: sourceURL, sourceName: LegadoSourceStore.shared.source(sourceURL)?.bookSourceName ?? "当前来源")], onRead: { replacement in
+                        showSources = false
+                        speaker.stop()
+                        book = replacement
+                        paginator = NovelPaginator(book: replacement)
+                        ref = NovelPageRef(chapter: store.progress[replacement.id]?.chapter ?? 0, index: 0)
+                        ready = false; version += 1
+                    }, resumeFrom: book)
+                }
+            }
+        }
         .preferredColorScheme(prefs.theme == .night ? .dark : .light)
         .onChange(of: speaker.sentence) { _, s in if let s { follow(s) } }
         .onChange(of: loader.revision) { _, _ in
@@ -293,10 +311,9 @@ struct NovelReaderView: View {
                     ForEach(book.chapters.indices, id: \.self) { i in
                         NovelTextView(text: scrollText(i))
                             .id(i)
-                            // onGeometryChange 是 iOS 18 的 SwiftUI API，iOS 17 上退化为不追踪
-                            // 滚动几何（小说照常滚动/翻章，仅顶部章节标题跟随不更新），
-                            // 与 VerticalPlayerView 的 feedScrollTracking 降级策略一致。
-                            .novelScrollGeometry { f in trackScroll(i, f) }
+                            .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("novel.scroll")) } action: { f in
+                            trackScroll(i, f)
+                        }
                     }
                 }
                 .padding(.horizontal, hMargin).padding(.top, 36).padding(.bottom, 80)
@@ -344,6 +361,11 @@ struct NovelReaderView: View {
                 }
                 .accessibilityIdentifier("novel.back")
                 Spacer()
+                if book.isWeb {
+                    Button { save(); showSources = true } label: { Text("换源").font(.system(size: 15, weight: .medium)).frame(minWidth: 44, minHeight: 44) }
+                    Button { showDownloads = true } label: { Image(systemName: "arrow.down.circle").font(.system(size: 22)).frame(width: 44, height: 44) }
+                        .accessibilityLabel("缓存与下载")
+                }
             }
             .foregroundStyle(pal.ink)
             .padding(.horizontal, 6)
@@ -896,8 +918,6 @@ struct PillSlider: View {
 
     var body: some View {
         GeometryReader { g in
-            // 显式标注 CGFloat：新 SDK 上 `3 + (…) * value.clamped` 会被推断成歧义表达式
-            // （error: ambiguous use of operator '-'）。
             let h: CGFloat = g.size.height
             let d: CGFloat = h - 6
             let x: CGFloat = 3 + (g.size.width - d - 6) * CGFloat(value.clamped)
@@ -923,20 +943,6 @@ struct PillSlider: View {
         .accessibilityValue(label ?? "\(Int(value * 100))%")
         .accessibilityAdjustableAction { dir in
             value = (value + (dir == .increment ? 0.05 : -0.05)).clamped
-        }
-    }
-}
-
-/// iOS 17 兼容层：几何回调 `onGeometryChange(for:of:action:)` 从 iOS 18 才有。
-/// 低版本退化为不追踪（页面仍可正常滚动、翻章、听书），避免旧系统上运行
-/// 未 back-deploy 的几何回调触发 SwiftUI 运行时崩溃。
-private extension View {
-    @ViewBuilder
-    func novelScrollGeometry(_ onFrame: @escaping (CGRect) -> Void) -> some View {
-        if #available(iOS 18.0, *) {
-            self.onGeometryChange(for: CGRect.self) { $0.frame(in: .named("novel.scroll")) } action: { f in onFrame(f) }
-        } else {
-            self
         }
     }
 }

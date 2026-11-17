@@ -8,16 +8,17 @@ struct PlayerIconButton: View {
 
     var body: some View {
         Button(action: action) {
-            // Design v3: 44 pt glass circle — black 55 % + blur + white 14 % 0.5 pt stroke.
+            // Redesign: 40 pt glass circle (rgba(20,20,24,.42) + blur 16, white 14 % hairline) in a 44 pt hit area.
             Image(systemName: symbol)
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(tint)
-                .frame(width: 44, height: 44)
+                .frame(width: 40, height: 40)
                 .background { Circle().fill(.ultraThinMaterial).overlay(Circle().fill(.black.opacity(0.42))) }
                 .overlay { Circle().strokeBorder(.white.opacity(0.14), lineWidth: 0.5) }
                 .environment(\.colorScheme, .dark)
+                .frame(width: 44, height: 44)
                 .contentShape(Circle())
-        }.buttonStyle(.plain).accessibilityLabel(label)
+        }.buttonStyle(PressScale()).accessibilityLabel(label)
     }
 }
 
@@ -89,7 +90,7 @@ struct PlayerProgressBar: View {
     @State private var dragStart: Double = 0
     @State private var thumb: UIImage?
 
-    private static let thin: CGFloat = 3, thick: CGFloat = 8, miniH: CGFloat = 2
+    private static let thin: CGFloat = 4, thick: CGFloat = 8, miniH: CGFloat = 2
 
     var body: some View {
         let duration = max(0, co.duration)
@@ -109,10 +110,10 @@ struct PlayerProgressBar: View {
                 if !mini {
                     Group {
                         if drag != nil { Circle().fill(.white).frame(width: 20, height: 20) }
-                        else { RoundedRectangle(cornerRadius: 2).fill(.white).frame(width: 4, height: 16) }
+                        else { Circle().fill(.white).frame(width: 14, height: 14) }
                     }
                     .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
-                    .offset(x: w * shown - (drag != nil ? 10 : 2))
+                    .offset(x: w * shown - (drag != nil ? 10 : 7))
                 }
             }
             .frame(maxHeight: .infinity)
@@ -126,7 +127,7 @@ struct PlayerProgressBar: View {
                         .accessibilityIdentifier("player.progress.bubble")
                 }
             }
-            .gesture(mini || duration <= 0 ? nil : DragGesture(minimumDistance: 0)
+            .gesture(mini || duration <= 0 ? nil : DragGesture(minimumDistance: 3)
                 .onChanged { v in
                     if drag == nil {
                         dragStart = played; scrubbing = true
@@ -142,7 +143,13 @@ struct PlayerProgressBar: View {
                     co.scrubPreview = nil
                     scrubbing = false
                     onInteract()
-                })
+                }
+                // A zero-distance drag can lose a stationary tap during SwiftUI gesture arbitration.
+                // Keep taps explicit and exclusive with scrubbing, so a release sends exactly one seek.
+                .exclusively(before: SpatialTapGesture().onEnded { v in
+                    co.seek(fraction: min(1, max(0, v.location.x / max(1, w))))
+                    onInteract()
+                }))
         }
         .frame(height: mini ? Self.miniH : 22)
         .task(id: drag.map { Int($0 * max(1, co.duration) / PlayerThumbnailer.bucket) }) {
@@ -246,64 +253,56 @@ struct PlayerPill: View {
     }
 }
 
-/// 长按倍速提示（对齐 Telegram）：半透明灰胶囊 + 「2x」 + 会脉动的双三角快进标。
-/// 参考截图：文字 2 大 x 小写，右侧两颗实心三角交替呼吸，形成持续的「加速中」动感。
+/// On-screen speed-control HUD while long-pressing.
 struct PlayerSpeedHUD: View {
     var rate: Double
+    var pendingLock: Bool
+    var pendingCancel: Bool
+    var hasLockedRate: Bool
 
-    private var rateNumber: String {
-        PlaybackCoordinator.formatRate(rate).replacingOccurrences(of: "x", with: "")
+    private var hint: String {
+        if pendingCancel { return "松开取消锁定 · 恢复 1x" }
+        if pendingLock { return "松开后锁定此倍速" }
+        if hasLockedRate { return "← → 调速 · ↑ 改锁定 · ↓ 取消锁定" }
+        return "← → 调速 · ↑ 锁定 · ↓ 取消"
     }
 
     var body: some View {
-        HStack(spacing: 7) {
-            HStack(alignment: .firstTextBaseline, spacing: 1) {
-                Text(rateNumber)
-                    .font(.system(size: 17, weight: .bold, design: .rounded).monospacedDigit())
-                Text("x")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: pendingCancel ? "xmark.circle.fill"
+                      : (pendingLock || hasLockedRate ? "lock.fill" : "gauge.with.dots.needle.67percent"))
+                    .font(.system(size: 18, weight: .semibold))
+                Text(PlaybackCoordinator.formatRate(rate))
+                    .font(.system(size: 28, weight: .bold, design: .rounded).monospacedDigit())
             }
-            .foregroundStyle(.white)
-            SpeedArrows()
-                .frame(width: 19, height: 13)
-        }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 5)
-        .background(.black.opacity(0.45), in: Capsule())
-    }
-}
+            .foregroundStyle(pendingCancel ? Color.orange : (pendingLock ? STVTheme.accent : .white))
 
-/// ⏩ 双实心三角：两颗透明度各自呼吸、相位错开，看上去像箭头在一下一下往前推。
-private struct SpeedArrows: View {
-    @State private var lit = false
+            Text(hint)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.white.opacity(0.72))
+                .multilineTextAlignment(.center)
 
-    var body: some View {
-        HStack(spacing: 1.5) {
-            ForEach(0..<2, id: \.self) { i in
-                ForwardTriangle()
-                    .fill(.white)
-                    .frame(width: 8, height: 12)
-                    .opacity(lit ? 1 : 0.38)
-                    .animation(
-                        .easeInOut(duration: 0.42)
-                            .repeatForever(autoreverses: true)
-                            .delay(Double(i) * 0.21),
-                        value: lit
-                    )
+            HStack(spacing: 14) {
+                Label("减慢", systemImage: "chevron.left")
+                Label("加快", systemImage: "chevron.right")
             }
+            .font(.caption2)
+            .foregroundStyle(.white.opacity(0.45))
+            .labelStyle(.titleAndIcon)
         }
-        .onAppear { lit = true }
-    }
-}
-
-private struct ForwardTriangle: Shape {
-    func path(in rect: CGRect) -> Path {
-        var p = Path()
-        p.move(to: CGPoint(x: rect.minX, y: rect.minY))
-        p.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
-        p.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
-        p.closeSubpath()
-        return p
+        .padding(.horizontal, 22)
+        .padding(.vertical, 16)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(
+                    LinearGradient(colors: [.white.opacity(0.3), .white.opacity(0.08)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing),
+                    lineWidth: 0.8
+                )
+        )
+        .shadow(color: .black.opacity(0.4), radius: 16, y: 6)
     }
 }
 
@@ -330,7 +329,8 @@ struct PlayerChromeShotHost: View {
                     .overlay(alignment: .leading) { Capsule().fill(STVTheme.accent).frame(width: 140, height: 3) }.padding(.vertical)
             }.padding(.horizontal, 20)
             if phase != .rightMenu {
-                PlayerSpeedHUD(rate: phase == .locked ? 2 : 1.5)
+                PlayerSpeedHUD(rate: phase == .locked ? 2 : 1.5, pendingLock: phase == .locked,
+                               pendingCancel: false, hasLockedRate: phase == .locked)
             }
         }
         .preferredColorScheme(.dark)

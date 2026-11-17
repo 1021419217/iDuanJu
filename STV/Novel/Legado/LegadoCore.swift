@@ -151,7 +151,7 @@ enum LegadoHTTP {
     nonisolated(unsafe) static var transport: ((URLRequest) throws -> (Data, HTTPURLResponse))?
 
     /// Synchronous request (book-source rules run on a worker thread).
-    static func fetch(_ req0: URLRequest, charset: String? = nil) throws -> LegadoResponse {
+    static func fetch(_ req0: URLRequest, charset: String? = nil, allowHTTPError: Bool = false) throws -> LegadoResponse {
         // `data:` URLs (API sources pack ids into them) answer locally, like Legado.
         if let u = req0.url, u.scheme == "data" {
             let raw = u.absoluteString.dropFirst(5)
@@ -177,7 +177,7 @@ enum LegadoHTTP {
             (data, resp) = (out.0 ?? Data(), r)
         }
         let headers = Dictionary(resp.allHeaderFields.map { ("\($0.key)".lowercased(), "\($0.value)") }, uniquingKeysWith: { a, _ in a })
-        guard (200..<400).contains(resp.statusCode) else { throw LegadoError.http(resp.statusCode, req.url?.absoluteString ?? "") }
+        guard allowHTTPError || (200..<400).contains(resp.statusCode) else { throw LegadoError.http(resp.statusCode, req.url?.absoluteString ?? "") }
         let text = decode(data, contentType: headers["content-type"], charset: charset)
         return LegadoResponse(url: resp.url ?? req.url!, status: resp.statusCode, headers: headers, body: data, text: text)
     }
@@ -274,11 +274,11 @@ final class LegadoJS {
                 getEncoder: () => ({ encodeToString: (b) => call('b64.enc', { b: bytesOf(b) }), encode: (b) => call('bytes.enc', { s: call('b64.enc', { b: bytesOf(b) }), cs: 'UTF-8' }) }),
             };
             function Inflater(nowrap) {
-                let input = [];
+                let input = [], decoded = null, position = 0;
                 return {
-                    setInput: (b, off, len) => { off = off || 0; input = b.slice(off, len == null ? b.length : off + len); },
-                    inflate: (out, off, len) => { const r = call('inflate', { b: input, nowrap: !!nowrap }); off = off || 0; const n = Math.min(r.length, len == null ? out.length - off : len); for (let i = 0; i < n; i++) out[off + i] = r[i]; return n; },
-                    end: () => {}, finished: () => true,
+                    setInput: (b, off, len) => { off = off || 0; input = b.slice(off, len == null ? b.length : off + len); decoded = null; position = 0; },
+                    inflate: (out, off, len) => { if (decoded === null) decoded = call('inflate', { b: input, nowrap: !!nowrap }); off = off || 0; const n = Math.min(decoded.length - position, len == null ? out.length - off : len); for (let i = 0; i < n; i++) out[off + i] = decoded[position + i]; position += n; return n; },
+                    end: () => { input = []; decoded = []; position = 0; }, finished: () => decoded !== null && position >= decoded.length,
                 };
             }
             const MessageDigest = { getInstance: (alg) => { let acc = []; return {
@@ -291,6 +291,73 @@ final class LegadoJS {
                     }; }, ENCRYPT_MODE: 1, DECRYPT_MODE: 2 };
             function SecretKeySpec(k, alg) { return { key: bytesOf(k), alg: str(alg) }; }
             function IvParameterSpec(v) { return { iv: bytesOf(v) }; }
+            // In-memory Java stream compatibility. No file/process/class access is exposed.
+            function ByteArrayOutputStream() {
+                let data = [];
+                return { write: (b, off, len) => {
+                    const a = typeof b === 'number' ? [b] : bytesOf(b).slice(off || 0, len == null ? b.length : (off || 0) + len);
+                    if (data.length + a.length > 16777216) throw new Error('字节流过大');
+                    data = data.concat(a.map(x => (x << 24) >> 24));
+                }, toByteArray: () => data.slice(), size: () => data.length, reset: () => { data = []; }, flush: () => {}, close: () => {} };
+            }
+            function GZIPOutputStream(out) {
+                const buffer = new ByteArrayOutputStream(); let finished = false;
+                const finish = () => { if (!finished) { out.write(call('gzip', { b: buffer.toByteArray(), encode: true })); finished = true; } };
+                return { write: buffer.write, finish, close: finish, flush: () => {} };
+            }
+            function GZIPInputStream(input) {
+                const b = input.bytes || bytesOf(input);
+                // HTTP libraries may have already decoded Content-Encoding while retaining headers.
+                return { bytes: b.length > 2 && (b[0] & 255) === 31 && (b[1] & 255) === 139 ? call('gzip', { b, encode: false }) : b };
+            }
+            function InputStreamReader(input, cs) { return { text: call('bytes.dec', { b: input.bytes || bytesOf(input), cs: cs || 'UTF-8' }) }; }
+            function BufferedReader(input) {
+                const lines = input.text.split(/\r\n|\n|\r/); let i = 0;
+                if (lines[lines.length - 1] === '') lines.pop();
+                return { readLine: () => i < lines.length ? lines[i++] : null, close: () => {} };
+            }
+            function JURL(url) { return { openConnection: () => {
+                let method = 'GET', headers = {}, response = null; const output = new ByteArrayOutputStream();
+                const send = () => response || (response = call('http.bytes', { url: str(url), method, headers, b: output.toByteArray() }));
+                return { setRequestMethod: m => { method = str(m); }, setRequestProperty: (k,v) => { headers[str(k)] = str(v); },
+                    setDoOutput: () => {}, setConnectTimeout: () => {}, setReadTimeout: () => {},
+                    getOutputStream: () => output, getResponseCode: () => send().status,
+                    getHeaderField: k => { const h = send().headers; const n = Object.keys(h).find(x => x.toLowerCase() === str(k).toLowerCase()); return n ? h[n] : null; },
+                    getInputStream: () => ({ bytes: send().b }), getErrorStream: () => ({ bytes: send().b }), disconnect: () => {} };
+            } }; }
+            function SecureRandom() { return { generateSeed: n => call('random.bytes', { n: Number(n) }), nextBytes: out => { const b = call('random.bytes', { n: out.length }); for (let i=0;i<b.length;i++) out[i]=b[i]; } }; }
+            function JBigInteger(a, b) {
+                const B = BigInt, zero = B(0), one = B(1), eight = B(8); let value;
+                if (typeof a === 'number' && b && typeof b.generateSeed === 'function') {
+                    if (a < 0 || a > 8192) throw new Error('大整数长度无效');
+                    const bytes = b.generateSeed(Math.ceil(a / 8)); value = zero;
+                    for (const byte of bytes) value = (value << eight) + B(byte & 255);
+                    if (a) value &= (one << B(a)) - one;
+                } else if (typeof a === 'number' && Array.isArray(b)) {
+                    value = zero; for (const byte of b) value = (value << eight) + B(byte & 255);
+                    if (a < 0) value = -value;
+                } else if (Array.isArray(a)) {
+                    value = zero; for (const byte of a) value = (value << eight) + B(byte & 255);
+                    if (a.length && (a[0] & 128)) value -= one << B(a.length * 8);
+                } else {
+                    const s = str(a); if (s.length > 8192) throw new Error('大整数过大');
+                    value = B(Number(b || 10) === 16 ? (s[0] === '-' ? '-0x' + s.slice(1) : '0x' + s) : s);
+                }
+                const other = x => B(x.toString());
+                const wrap = v => new JBigInteger(v.toString(), 10);
+                const obj = { toString: radix => value.toString(Number(radix || 10)),
+                    subtract: x => wrap(value - other(x)), add: x => wrap(value + other(x)),
+                    mod: x => { const m = other(x); if(m <= zero) throw new Error('模数无效'); return wrap((value % m + m) % m); },
+                    modPow: (x,y) => { let e = other(x), m = other(y), r = one; if(e < zero || m <= zero) throw new Error('模幂参数无效');
+                        if (e.toString(2).length > 8192 || m.toString(2).length > 8192) throw new Error('模幂参数过大');
+                        let v = (value % m + m) % m; while(e > zero) { if(e & one) r = r*v%m; e >>= one; v=v*v%m; } return wrap(r % m); },
+                    toByteArray: () => { let n=1; while(value < -(one << B(n*8-1)) || value >= (one << B(n*8-1))) n++;
+                        let v = value < zero ? (one << B(n*8)) + value : value; const out=new Array(n);
+                        for(let i=n-1;i>=0;i--) { out[i]=Number(v & B(255)); if(out[i]>=128)out[i]-=256; v >>= eight; } return out; } };
+                return obj;
+            }
+            JBigInteger.valueOf = n => new JBigInteger(str(n),10);
+            JBigInteger.ONE = JBigInteger.valueOf(1);
             // Rhino scope helpers: `this.getHeaderMap()` (the request headers) and login state (not supported → empty).
             globalThis.getHeaderMap = () => call('headers', null);
 globalThis.getSource = () => globalThis.source;
@@ -302,10 +369,10 @@ globalThis.getSource = () => globalThis.source;
   globalThis.__wrapSource = (src) => {
 src.getKey = () => src.bookSourceUrl;
     src.key = src.bookSourceUrl;
-    src.getVariable = () => java.get('__sourceVariable');
-    src.setVariable = (v) => java.put('__sourceVariable', str(v));
-    src.get = (k) => java.get(k);
-    src.put = (k, v) => java.put(k, v);
+    src.getVariable = () => call('sourceGet', {k:'__sourceVariable'});
+    src.setVariable = (v) => call('sourcePut', {k:'__sourceVariable',v:str(v)});
+    src.get = (k) => call('sourceGet', {k:str(k)});
+    src.put = (k, v) => call('sourcePut', {k:str(k),v:str(v)});
     src.getLoginInfo = () => call('loginInfo', null);
 src.getLoginInfoMap = () => __jmap(parseObj(call('loginInfo', null)));
     src.putLoginInfo = (v) => { call('putLoginInfo', { v: str(v) }); return true; };
@@ -317,6 +384,7 @@ src.getLoginHeaderMap = () => __jmap(parseObj(call('loginHeader', null)));
     src.getLoginJs = () => '';
     return src;
   };
+  globalThis.java.refreshExplore = () => true;
   globalThis.cache = {
     get: (k) => call('cacheGet', { k: str(k) }),
     put: (k, v, sec) => { call('cachePut', { k: str(k), v: v == null ? null : str(v), sec: Number(sec || 0) }); return v; },
@@ -424,7 +492,7 @@ src.getLoginHeaderMap = () => __jmap(parseObj(call('loginHeader', null)));
     return m;
   };
   globalThis.Packages = {
-                    java: { lang: { String: JString, Thread: { sleep: () => {} } }, util: { Arrays, Base64, zip: { Inflater } }, security: { MessageDigest } },
+                    java: { lang: { String: JString, Thread: { sleep: () => {} } }, nio: { charset: { Charset: { forName: (name) => str(name) }, StandardCharsets: { UTF_8: 'UTF-8' } } }, util: { Arrays, Base64, UUID: { randomUUID: () => java.randomUUID() }, zip: { Inflater, GZIPOutputStream, GZIPInputStream } }, security: { MessageDigest, SecureRandom }, io: { ByteArrayOutputStream, InputStreamReader, BufferedReader }, net: { URL: JURL }, math: { BigInteger: JBigInteger } },
                     javax: { crypto: { Cipher, spec: { SecretKeySpec, IvParameterSpec } } },
                     cn: { hutool: { crypto: { digest: { DigestUtil: { md5Hex: (s) => java.md5Encode(s) } } } } },
                 };
@@ -457,6 +525,8 @@ src.getLoginHeaderMap = () => __jmap(parseObj(call('loginHeader', null)));
                         openUrl: () => {}, open: () => {}, getThemeConfig: () => ({}),
                 });
 
+                Object.assign(globalThis.java, Packages.java);
+                globalThis.javax = Packages.javax;
                 globalThis.__legado_call = call;
         })(__host);
 """#
@@ -477,7 +547,7 @@ src.getLoginHeaderMap = () => __jmap(parseObj(call('loginHeader', null)));
         }
         // `book` / `source` / `chapter` objects also answer Legado's getter style (book.getVariable, source.getKey()).
         header += "if (typeof source === 'object' && source) __wrapSource(source);\n"
-        header += "if (typeof book === 'object' && book) { book.getVariable = () => ''; }\n"
+        header += "if (typeof book === 'object' && book) { book.getVariable = (k) => java.get(k || '__bookVariable'); book.setVariable = (k,v) => java.put(v === undefined ? '__bookVariable' : k, v === undefined ? k : v); }\n"
         // jsLib and the snippet run as separate scripts (separate scopes in Legado). Top-level `let` / `const` become
         // `var` so names declared in both, or by two snippets, do not clash in the shared global scope.
         if let lib = jsLib, !lib.isEmpty {
@@ -490,7 +560,7 @@ src.getLoginHeaderMap = () => __jmap(parseObj(call('loginHeader', null)));
         }
         // The snippet runs inside a block: its top-level let / const stay local (no clash with the injected globals,
         // jsLib or earlier snippets) and the block's completion value is still the result.
-        var src = header + "{\n" + code + "\n}"
+        var src = header + "{\n" + Self.compatibleSyntax(code) + "\n}"
         #if DEBUG
         // STV_LEGADO_JSSTACK=1: error messages carry the JS stack (to find which call failed in a big jsLib).
         if ProcessInfo.processInfo.environment["STV_LEGADO_JSSTACK"] == "1" {
@@ -508,7 +578,13 @@ src.getLoginHeaderMap = () => __jmap(parseObj(call('loginHeader', null)));
     }
 
     static func relaxed(_ js: String) -> String {
-        js.replacingOccurrences(of: #"(?m)^(\s{0,4})(?:let|const)(\s+[A-Za-z_$])"#, with: "$1var$2", options: .regularExpression)
+        compatibleSyntax(js).replacingOccurrences(of: #"(?m)^(\s{0,4})(?:let|const)(\s+[A-Za-z_$])"#, with: "$1var$2", options: .regularExpression)
+    }
+
+    // Rhino accepts the collection's `map([a,b]=>...)`; QuickJS requires parentheses.
+    static func compatibleSyntax(_ js: String) -> String {
+        js.replacingOccurrences(of: #"(\b(?:map|forEach|filter)\s*\(\s*)(\[[A-Za-z_$][A-Za-z0-9_$,\s]*\])\s*=>"#,
+                                with: "$1($2)=>", options: .regularExpression)
     }
 
     static func message(_ err: UnsafeMutablePointer<CChar>?) -> String {

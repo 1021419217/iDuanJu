@@ -30,6 +30,11 @@ Pornhub (mediaDefinitions) were cross-checked against its extractors. The Swift 
   also bundled as `STV/Resources/Licenses/quickjs-ng-LICENSE.txt` and shown in 开源许可.
 - `idj_sandbox.c/.h` (eval-less sandbox wrapper, interrupt deadline, host bridge) is this app's own code.
 
+## Rhino — Mozilla Public License 2.0
+- https://github.com/mozilla/rhino, version 1.7.15, unmodified Maven dependency `org.mozilla:rhino`.
+- Android book-source JavaScript evaluation runs interpreted, with a class shutter and explicit host bridge; no Java class or filesystem access is exposed to source scripts.
+- License: `STV/Resources/Licenses/Rhino-MPL-2.0.txt` (also bundled with Android). The shared Legado compatibility prelude is this project's own code.
+
 ## JMComic-Crawler-Python — MIT (algorithm reference only)
 - https://github.com/hect0x7/JMComic-Crawler-Python — the public 18comic image segment algorithm
   (`JmImageTool.get_num` / `decode_and_save`) was re-implemented in Swift (`ImageStripes`) and in the bundled
@@ -77,5 +82,22 @@ which credits fqapp / N3urda/hongguoTV. The test vectors in `STVTests/PrefetchTe
 Source reference: https://github.com/zfdang/hongguo-open-player/commit/3f687c5
 
 ## License compatibility
+### Current Hongguo player signer (2026-11-16)
+
+`HGCurrentPlayer.swift` / `HGCurrentPlayer.kt` and `HGCurrentProfile.*` are ports of
+`my-name-is-alan/get_video_streaming`, commit `0613b49`,
+`internal/provider/hongguo/playersign/current*.go`. Swift and Kotlin use the same
+fixed application constants and synthetic native test vectors. The KS/custom
+transform originated in OpenHongguo commit `05aa580a2fa914becabc5ae4be5b05539c66bda6`
+under Apache-2.0 and was modified and validated by the gateway implementation.
+The ports adapt byte arithmetic, request construction and error handling to each
+platform; category requests keep their separate 551 signing profile.
+
+License and upstream notice: `STV/Resources/Licenses/HGCurrentPlayer-Apache-2.0.txt`
+and `STV/Resources/Licenses/HGCurrentPlayer-NOTICE.md`. The constants are protocol
+data, not device identities or session credentials. No captured SDK token is used
+by the current player signer. Native synthetic vectors test arithmetic only;
+server availability is checked separately.
+
 All components above (Apache-2.0, MIT, BSD-2-Clause, WTFPL, BSL-1.0, Unlicense, LGPL-2.1/LGPL-3.0 with exception, GPL-3.0-only) are
 compatible with distributing the whole work under GPL-3.0. This project itself is licensed under **GPL-3.0** (see `LICENSE`).

@@ -27,17 +27,17 @@ fun SourcesScreen(onBack: () -> Unit) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     var confirmAdult by remember { mutableStateOf(false) }
     var adStrip by remember { mutableStateOf(app.iduanju.core.hls.HLSAdFilter.enabled) }
+    var prefetch by remember { mutableStateOf(ia.settings.prefetchEnabled) }
+    var cacheMB by remember { mutableIntStateOf(ia.settings.playbackCacheMB) }
     var message by remember { mutableStateOf<String?>(null) }
     val adult = ia.cms.adultUnlocked
 
     SettingsPage("片源管理", onBack) {
         Group("内置") {
             BuiltinRow("红果短剧", ProfileIcons.play)
-            RowDivider()
-            BuiltinRow("黄果短剧", ProfileIcons.film, if (adult) null else "成人 · 默认隐藏")
         }
         Group("成人内容（默认隐藏）", footer = "开启后黄果、标记为成人的采集站 / 插件 / Telegram 频道 / 漫画插件才会出现在首页、搜索、频道与漫画；所有结果一律过滤未成年人与非自愿题材。") {
-            SwitchRow("显示成人片源", null, "仅限年满 18 周岁", adult) {
+            SwitchRow("显示成人片源", ProfileIcons.film, "黄果短剧、成人采集站 / 插件 / 频道 / 漫画 · 仅限年满 18 周岁", adult) {
                 if (it) confirmAdult = true else { ia.cms.adultUnlocked = false; message = "已隐藏成人片源" }
             }
         }
@@ -47,8 +47,14 @@ fun SourcesScreen(onBack: () -> Unit) {
         Group("播放") {
             SwitchRow("去广告", ProfileIcons.adblock, "去掉 HLS 片源里插播的广告片段（adjump、异域名短片段、重复片段）", adStrip) {
                 adStrip = it; app.iduanju.core.hls.HLSAdFilter.enabled = it
-                ctx.getSharedPreferences("idj", android.content.Context.MODE_PRIVATE).edit().putBoolean("stv.hls.adstrip", it).apply()
+                ia.settings.adStripEnabled = it
             }
+            SwitchRow("预加载下一集", ProfileIcons.download, "播放时提前缓存下一集，可减少切集等待", prefetch) {
+                prefetch = it; ia.settings.prefetchEnabled = it
+            }
+            Text("播放缓存上限：${cacheMB} MB", color = c.text, modifier = Modifier.padding(14.dp))
+            androidx.compose.material3.Slider(value = cacheMB.toFloat(), onValueChange = { cacheMB = (it / 100).toInt() * 100 },
+                onValueChangeFinished = { ia.settings.playbackCacheMB = cacheMB }, valueRange = 100f..2000f, steps = 18, modifier = Modifier.padding(horizontal = 14.dp))
         }
         DeviceOverrideGroup()
         Note(message)

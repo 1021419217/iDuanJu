@@ -67,8 +67,6 @@ enum Route: Hashable {
     case actor(HGCelebrity)
     case search
     case searchFor(String)
-    /// 从首页某个站源里点搜索：直接在该站源里搜，而不是全局搜索。
-    case searchIn(DramaSource)
     case actorRank
     case favorites
     case history
@@ -105,13 +103,10 @@ extension View {
             switch r {
             case .series(let s): DramaDetailView(series: s)
             case .board(let b): BoardListView(board: b)
-            // 兜底分支：正常路径已全部改走 PlayerPresenter.fullScreenCover（见 PlayerPresenter
-            // 注释）。万一还有代码 push 到这里，宁可什么都不做，也不要再进导航栈。
-            case .play: EmptyView()
+            case .play(let s, let i): VerticalPlayerView(series: s, startIndex: i)
             case .actor(let a): ActorView(actor: a)
             case .search: SearchView(pushed: true)
             case .searchFor(let q): SearchView(pushed: true, initialQuery: q)
-            case .searchIn(let s): SearchView(pushed: true, initialSource: s)
             case .actorRank: ActorRankView()
             case .favorites: LibraryListView(kind: .favorites)
             case .history: LibraryListView(kind: .history)
@@ -143,17 +138,6 @@ extension UINavigationController: @retroactive UIGestureRecognizerDelegate {
     }
 
     public func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
-        // 播放器是 RootTabView 上的 SwiftUI 叠层，不在导航栈里。它在屏时，左边缘右滑
-        // 由播放器自己的 edgeBackGesture 独占；绝不能让导航栈在这里发起交互式 pop ——
-        // 被 pop 的会是播放器背后的详情页，而这次交互式转场一旦被播放器手势抢走收尾，
-        // 就是历史上「转场停在半路、透明容器吃掉触摸」的入口。
-        // 纯状态判断，不碰任何视图 / 窗口 / 方向；播放器关闭后自动恢复。
-        if PlayerPresenter.shared.route != nil { return false }
-        // 转场动画进行中，绝不允许开启交互式返回。
-        // UIKit 会把进行中的 push/pop 切成 interactive，之后没有任何人再给它 update / end，
-        // 转场就停在半路：导航栏已经换了、内容只推进一半、转场容器留在窗口上吃掉全部触摸，
-        // 而底层 SwiftUI 动画还在跑 —— 用户看到的就是「黑一块、点哪都没反应、图还在动」。
-        if let tc = transitionCoordinator, tc.isAnimated { return false }
         guard viewControllers.count > 1 else { return false }
         guard g == interactivePopGestureRecognizer,
               let pan = g as? UIPanGestureRecognizer else {
@@ -189,41 +173,26 @@ extension UINavigationController: @retroactive UIGestureRecognizerDelegate {
     }
 }
 
-/// 播放器在屏上时，把导航栈的边缘返回手势**关掉**。
-///
-/// 播放器已经不是 push 进导航栈的页面了，但详情页还在导航栈里（就在播放器下面）。
-/// `interactivePopGestureRecognizer` 是屏幕级手势，优先级高于播放器内部的手势：
-/// 在播放器上从左边缘往右滑，被 pop 的是背后那个详情页。如果这次交互式 pop 在
-/// 手指抬起前被打断（播放器的手势 / 视图移除抢走了 touchEnd），UIKit 会一直停在
-/// interactive 状态，把那层 `UITransitionView` 留在窗口上 —— 又是「画面正常、
-/// 轮播还在动、点哪都没反应」。
-///
-/// 所以播放器出现时禁用，消失时按导航栈深度恢复（只剩根页面时保持禁用）。
-struct NavPopGate: UIViewRepresentable {
-    func makeUIView(context: Context) -> UIView { GateView() }
-    func updateUIView(_ uiView: UIView, context: Context) { (uiView as? GateView)?.apply() }
+/// Re-enable interactive pop on appear (SwiftUI may leave it disabled when the bar is hidden).
+struct InteractivePopEnabler: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView { PopEnablerView() }
+    func updateUIView(_ uiView: UIView, context: Context) {
+        (uiView as? PopEnablerView)?.enablePop()
+    }
 
-    final class GateView: UIView {
-        private weak var nav: UINavigationController?
-
+    final class PopEnablerView: UIView {
         override func didMoveToWindow() {
             super.didMoveToWindow()
-            apply()
+            enablePop()
         }
         override func layoutSubviews() {
             super.layoutSubviews()
-            apply()
+            enablePop()
         }
-        /// 视图被 SwiftUI 拆掉时会先收到 willMove(toWindow: nil)，在这里恢复。
-        override func willMove(toWindow newWindow: UIWindow?) {
-            super.willMove(toWindow: newWindow)
-            guard newWindow == nil, let n = nav else { return }
-            n.interactivePopGestureRecognizer?.isEnabled = n.viewControllers.count > 1
-            nav = nil
-        }
-        func apply() {
-            if nav == nil { nav = nearestNavigationController() }
-            nav?.interactivePopGestureRecognizer?.isEnabled = false
+        func enablePop() {
+            guard let nav = nearestNavigationController() else { return }
+            nav.interactivePopGestureRecognizer?.isEnabled = true
+            nav.interactivePopGestureRecognizer?.delegate = nav
         }
         private func nearestNavigationController() -> UINavigationController? {
             var r: UIResponder? = self
@@ -243,9 +212,14 @@ struct ErrorStateView: View {
     let error: Error
     let retry: () -> Void
     @State private var verify: VerifyTarget?
+    private var title: String {
+        guard let t = error.verifyTarget else { return "加载失败" }
+        // 黄果 never auto-solves (issue #12): the user verifies in the visible sheet.
+        return t.source == .huangguo ? "需要验证" : "需要站点验证（自动验证未通过）"
+    }
     var body: some View {
         ContentUnavailableView {
-            Label(error.verifyTarget == nil ? "加载失败" : "需要站点验证（自动验证未通过）",
+            Label(title,
                   systemImage: error.verifyTarget == nil ? "wifi.exclamationmark" : "shield.lefthalf.filled")
         } description: {
             Text(error.localizedDescription)

@@ -2,12 +2,10 @@ import SwiftUI
 import UIKit
 import MediaPlayer
 import AVFoundation
-import Observation
 
-/// Brightness vertical-swipe adjustment for the player (left zone).
-/// Volume is intentionally NOT controlled here: no hidden MPVolumeView is installed, so iOS
-/// shows its native volume HUD (the bars) when the hardware buttons are pressed. Swipe-to-adjust
-/// volume is dropped on purpose per the user's request.
+/// Brightness (left) / volume (right) vertical-swipe adjustment for the player.
+/// Zones: outer 1/5 strips in both orientations (the middle keeps episode paging),
+/// always excluding the edge-back strip. Brightness is restored when the player goes away.
 enum AdjustSide { case brightness, volume }
 
 @MainActor @Observable
@@ -19,15 +17,10 @@ final class PlayerAdjuster {
     /// Hidden MPVolumeView slider — the sanctioned way to set system volume.
     weak var volumeSlider: UISlider?
 
-    // No system-volume observation here: the native iOS volume HUD is shown by the system
-    // itself now that the hidden MPVolumeView is gone. Adding a custom HUD on top of it would
-    // only double up the indicators.
     static func zone(x: CGFloat, width: CGFloat, landscape: Bool, edge: CGFloat) -> AdjustSide? {
         guard width > 0, x >= edge, x <= width - 8 else { return nil }
-        // Only brightness is swipe-adjustable now. Volume is driven by the hardware buttons
-        // and shown by the native iOS volume HUD; swipe-to-adjust-volume is dropped on purpose.
-        if landscape { return x < width / 2 ? .brightness : nil }
         if x < width * 0.2 { return .brightness }
+        if x > width * 0.8 { return .volume }
         return nil
     }
 
@@ -67,8 +60,7 @@ final class PlayerAdjuster {
     }
 }
 
-/// Kept for reference but intentionally NOT mounted: an on-screen MPVolumeView (even at
-/// alpha 0.01) suppresses iOS's native volume HUD, which the user wants visible.
+/// Invisible MPVolumeView; hands its UISlider to the adjuster (also suppresses the system volume HUD).
 struct HiddenVolumeView: UIViewRepresentable {
     let adjuster: PlayerAdjuster
     func makeUIView(context: Context) -> MPVolumeView {

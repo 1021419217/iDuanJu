@@ -26,11 +26,17 @@ import app.iduanju.core.cms.MacCMS
 import app.iduanju.core.hongguo.HGSeries
 import app.iduanju.ui.theme.IdjThemeColors
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** iOS HomeFeedPage for `.site(cms)`. */
 @Composable
 fun SiteFeedPage(site: CMSSite, onOpen: (String) -> Unit) {
+    LaunchedEffect(site.key) {
+        val categories = withContext(Dispatchers.IO) { runCatching { MacCMS.fetchCategories(site.api) }.getOrNull() }
+        if (!categories.isNullOrEmpty()) IdjApp.instance.cms.cacheCategories(site.key, categories)
+    }
     FeedGrid("cms:" + site.key, listOf("" to "最新") + site.categories.map { it.id to it.name }, { cat, page ->
         val o = MacCMS.fetch(site.api, buildMap { put("ac", "detail"); put("pg", page.toString()); if (cat.isNotEmpty()) put("t", cat) })
         if (cat.isEmpty() && page == 1) MacCMS.parseCategories(o).takeIf { it.isNotEmpty() }?.let { IdjApp.instance.cms.cacheCategories(site.key, it) }
@@ -56,12 +62,14 @@ fun PluginFeedPage(p: app.iduanju.plugin.PluginStore.Installed, onOpen: (String)
 @Composable
 fun FeedGrid(key: String, cats: List<Pair<String, String>>, load: (String, Int) -> app.iduanju.core.hongguo.HGPage, onOpen: (String) -> Unit) {
     val c = IdjThemeColors
+    val scope = rememberCoroutineScope()
     var sel by remember(key) { mutableIntStateOf(0) }
     val items = remember(key, sel) { mutableStateListOf<HGSeries>() }
     var page by remember(key, sel) { mutableIntStateOf(1) }
     var hasMore by remember(key, sel) { mutableStateOf(true) }
     var loading by remember(key, sel) { mutableStateOf(false) }
     var error by remember(key, sel) { mutableStateOf<String?>(null) }
+    var verify by remember(key, sel) { mutableStateOf<app.iduanju.core.util.VerificationRequiredException?>(null) }
     val grid = rememberLazyGridState()
 
     suspend fun more() {
@@ -72,8 +80,10 @@ fun FeedGrid(key: String, cats: List<Pair<String, String>>, load: (String, Int) 
             val p = withContext(Dispatchers.IO) { load(cat, page) }
             val seen = items.map { it.seriesId }.toHashSet()
             items.addAll(p.items.filter { seen.add(it.seriesId) })
-            hasMore = p.hasMore; page += 1; error = null
-        } catch (e: Exception) { error = e.message ?: "加载失败"; hasMore = false }
+            hasMore = p.hasMore; page += 1; error = null; verify = null
+        } catch (e: CancellationException) { throw e }
+        catch (e: app.iduanju.core.util.VerificationRequiredException) { verify = e; error = "需要验证" }
+        catch (e: Exception) { error = e.message ?: "加载失败" }
         finally { loading = false }
     }
     LaunchedEffect(key, sel) { more() }
@@ -99,8 +109,9 @@ fun FeedGrid(key: String, cats: List<Pair<String, String>>, load: (String, Int) 
             Box(Modifier.fillMaxWidth().padding(20.dp), contentAlignment = Alignment.Center) {
                 when {
                     loading -> CircularProgressIndicator(color = c.secondary, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
-                    error != null -> Text(error!!, color = c.secondary, fontSize = 13.sp)
-                    items.isEmpty() -> Text("暂无内容", color = c.secondary, fontSize = 13.sp)
+                    verify != null -> app.iduanju.huangguo.VerifyRequiredState(verify!!) { scope.launch { more() } }
+                    error != null -> Text(error!! + " · 点击重试", color = c.secondary, fontSize = 13.sp, modifier = Modifier.clickable { scope.launch { more() } })
+                    items.isEmpty() -> Text("该分类暂无内容，请尝试具体子分类", color = c.secondary, fontSize = 13.sp)
                 }
             }
         }

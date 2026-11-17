@@ -157,7 +157,7 @@ struct SourceManageView: View {
     private var universe: [HomeSource] {
         var out: [HomeSource] = [.hongguo, .huangguo, .ai]
         out += Sites.all.map { HomeSource.site($0) }
-        out += [.manga, .novel]
+        out += [.manga]  // 本构建不含小说模块
         return out
     }
 

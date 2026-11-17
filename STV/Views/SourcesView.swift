@@ -18,15 +18,6 @@ struct SourcesView: View {
                 } else {
                     group("内置") {
                         builtinRow(.hongguo, "play.rectangle.on.rectangle")
-                        Divider().padding(.leading, 48)
-                        NavigationLink { SourceManageView() } label: {
-                            HStack {
-                                label("站源管理", "arrow.up.arrow.down.circle", sub: "排序 / 删除首页显示的内置源与站点源，包括红果；删除只是隐藏，可随时恢复")
-                                Spacer(); chevron
-                            }.padding(14)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityIdentifier("sources.manage")
                     }
                     group("18+ 片源（默认隐藏）") {
                         Toggle(isOn: Binding(get: { gate.huangguo }, set: { gate.setHuangguo($0) })) {
@@ -181,6 +172,10 @@ struct PlayerCoreLicenses: View {
         let id: String; let title: String; let license: String; let links: [(String, String)]; let note: String; let files: [String]
     }
     private let items: [Item] = [
+        Item(id: "hg-current", title: "红果当前播放器签名", license: "Apache-2.0 变换来源 · OpenHongguo / gateway 0613b49",
+             links: [("网关源码提交", "https://github.com/my-name-is-alan/get_video_streaming/commit/0613b49")],
+             note: "当前 Medusa 封装移植自网关。KS/自定义变换源自 OpenHongguo 05aa580，按原生合成向量核对；具体来源和修改范围见 THIRD_PARTY_NOTICES.md。",
+             files: ["HGCurrentPlayer-Apache-2.0"]),
         Item(id: "aether", title: "AetherEngine 7.62.0", license: "LGPL-3.0 + App Store / DRM Exception · Copyright © 2026 Vincent Herbst",
              links: [("源码（7.62.0 标签）", "https://github.com/superuser404notfound/AetherEngine/tree/7.62.0")],
              note: "播放内核，静态链接，未修改。依据其 App Store / DRM 例外条款分发；对应源码见上方 7.62.0 标签。",

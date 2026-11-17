@@ -3,6 +3,7 @@ import CommonCrypto
 import Compression
 import CryptoKit
 import Security
+import zlib
 
 /// Regex "all in one" match (`:regex` list rules): group texts, `$0` = whole match.
 struct LegadoGroups { var groups: [String] }
@@ -85,8 +86,28 @@ final class LegadoContext {
             if let h = a["headers"] as? [String: Any] { for (k, v) in h { r.request.setValue("\(v)", forHTTPHeaderField: k) } }
             let resp = try r.fetch()
             return ["body": resp.text, "status": resp.status, "url": resp.url.absoluteString, "headers": resp.headers]
+        case "http.bytes":
+            guard let url = URL(string: s("url")), ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else { throw LegadoError.rule("书源 HTTP 地址无效") }
+            var request = URLRequest(url: url, timeoutInterval: 20)
+            let method = s("method").uppercased()
+            guard ["GET", "POST"].contains(method) else { throw LegadoError.rule("书源 HTTP 方法不支持") }
+            request.httpMethod = method
+            if method == "POST" { request.httpBody = LegadoBytes.data(a["b"]) }
+            if let headers = a["headers"] as? [String: String] { for (k,v) in headers { request.setValue(v, forHTTPHeaderField: k) } }
+            let response = try LegadoHTTP.fetch(request, allowHTTPError: true)
+            guard response.body.count <= 8 * 1024 * 1024 else { throw LegadoError.rule("书源响应过大") }
+            return ["status": response.status, "headers": response.headers, "b": LegadoBytes.json(response.body)]
+        case "random.bytes":
+            let n = a["n"] as? Int ?? -1
+            guard (0...8192).contains(n) else { throw LegadoError.rule("随机字节长度无效") }
+            var bytes = [UInt8](repeating: 0, count: n)
+            if n > 0 { guard SecRandomCopyBytes(kSecRandomDefault, n, &bytes) == errSecSuccess else { throw LegadoError.rule("随机数生成失败") } }
+            return LegadoBytes.json(Data(bytes))
+        case "gzip": return LegadoBytes.json(try LegadoBytes.gzip(LegadoBytes.data(a["b"]), encode: a["encode"] as? Bool == true))
         case "putVar": putVar(s("k"), s("v")); return nil
         case "getVar": return getVar(s("k"))
+        case "sourceGet": return LegadoVars.get(sourceScope, s("k")) ?? ""
+        case "sourcePut": LegadoVars.put(sourceScope, s("k"), s("v")); return s("v")
         case "getString", "getStringList":
             guard let cur = stack.last else { return name == "getString" ? "" : [] }
             let an = a["content"] is String ? LegadoAnalyzer(s("content"), baseURL: cur.baseURL, ctx: self) : cur
@@ -777,6 +798,15 @@ enum LegadoURL {
         let charset = options["charset"] as? String
         // {{ }} templates
         rule = try substitute(rule, ctx: ctx, base: base, charset: charset, encodeKey: true)
+        // A template (e.g. {{qmTag(...)}}) may return a complete request + options.
+        // Parse that suffix after evaluation, before URL encoding eats the JSON.
+        if let range = Self.optionsStart(rule) {
+            let tail = String(rule[rule.index(after: range.lowerBound)...])
+            if let generated = lenientObject(tail, ctx: ctx) {
+                options.merge(generated) { _, new in new }
+                rule = String(rule[..<range.lowerBound])
+            }
+        }
         guard let url = resolve(rule, base: base) else { throw LegadoError.rule("网址无效：\(rule)") }
         var req = URLRequest(url: url)
         req.setValue(LegadoHTTP.userAgent, forHTTPHeaderField: "User-Agent")
@@ -836,7 +866,11 @@ enum LegadoURL {
         while i < rule.endIndex {
             if rule[i...].hasPrefix("{{") { depth += 1; i = rule.index(i, offsetBy: 2); continue }
             if depth > 0, rule[i...].hasPrefix("}}") { depth -= 1; i = rule.index(i, offsetBy: 2); continue }
-            if depth == 0, rule[i...].hasPrefix(",{") { outside.append(i..<rule.index(i, offsetBy: 2)) }
+            if depth == 0, rule[i] == "," {
+                var next = rule.index(after: i)
+                while next < rule.endIndex, rule[next].isWhitespace { next = rule.index(after: next) }
+                if next < rule.endIndex, rule[next] == "{" { outside.append(i..<rule.index(after: next)) }
+            }
             i = rule.index(after: i)
         }
         return outside.last
@@ -1012,6 +1046,32 @@ enum LegadoBytes {
         return out
     }
 
+    static func gzip(_ data: Data, encode: Bool) throws -> Data {
+        guard data.count <= 16 * 1024 * 1024 else { throw LegadoError.rule("压缩输入过大") }
+        var stream = z_stream()
+        let status = encode
+            ? deflateInit2_(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+            : inflateInit2_(&stream, 31, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+        guard status == Z_OK else { throw LegadoError.rule("GZIP 初始化失败") }
+        defer { if encode { deflateEnd(&stream) } else { inflateEnd(&stream) } }
+        var input = [UInt8](data), output = Data(), buffer = [UInt8](repeating: 0, count: 16384)
+        try input.withUnsafeMutableBufferPointer { src in
+            stream.next_in = src.baseAddress; stream.avail_in = uInt(src.count)
+            while true {
+                let result = buffer.withUnsafeMutableBufferPointer { dst -> Int32 in
+                    stream.next_out = dst.baseAddress; stream.avail_out = uInt(dst.count)
+                    return encode ? deflate(&stream, Z_FINISH) : zlib.inflate(&stream, Z_NO_FLUSH)
+                }
+                let count = buffer.count - Int(stream.avail_out)
+                guard output.count + count <= 16 * 1024 * 1024 else { throw LegadoError.rule("GZIP 输出过大") }
+                output.append(contentsOf: buffer.prefix(count))
+                if result == Z_STREAM_END { break }
+                guard result == Z_OK, count > 0 || stream.avail_in > 0 else { throw LegadoError.rule("GZIP 数据无效或截断") }
+            }
+        }
+        return output
+    }
+
     /// Raw deflate (Inflater(true)) or zlib-wrapped (header + adler32 trailer).
     static func inflate(_ d: Data, raw: Bool) throws -> Data {
         guard !d.isEmpty else { return Data() }
@@ -1033,6 +1093,7 @@ enum LegadoBytes {
                 stream.dst_ptr = dst
                 stream.dst_size = capacity
                 let st = compression_stream_process(&stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+                guard out.count + capacity - stream.dst_size <= 16 * 1024 * 1024 else { throw LegadoError.rule("解压内容过大") }
                 out.append(dst, count: capacity - stream.dst_size)
                 if st == COMPRESSION_STATUS_END { break }
                 guard st == COMPRESSION_STATUS_OK else { throw LegadoError.rule("解压失败") }

@@ -17,6 +17,7 @@ struct LegadoSource: Codable, Hashable, Identifiable {
     var loginUi: String?
     var jsLib: String?
     var ruleSearch: [String: String]?
+    var ruleExplore: [String: String]?
     var ruleBookInfo: [String: String]?
     var ruleToc: [String: String]?
     var ruleContent: [String: String]?
@@ -25,11 +26,11 @@ struct LegadoSource: Codable, Hashable, Identifiable {
     var id: String { bookSourceUrl }
     var isOn: Bool { enabled ?? true }
     var hasLogin: Bool { !(loginUrl ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    var supported: Bool { (bookSourceType ?? 0) == 0 && !(searchUrl ?? "").isEmpty }
+    var supported: Bool { (bookSourceType ?? 0) == 0 && (!(searchUrl ?? "").isEmpty || !(exploreUrl ?? "").isEmpty) }
 
     enum CodingKeys: String, CodingKey {
         case bookSourceUrl, bookSourceName, bookSourceGroup, bookSourceType, bookSourceComment, enabled, header, searchUrl,
-        exploreUrl, loginUrl, loginUi, jsLib, ruleSearch, ruleBookInfo, ruleToc, ruleContent, customOrder
+        exploreUrl, loginUrl, loginUi, jsLib, ruleSearch, ruleExplore, ruleBookInfo, ruleToc, ruleContent, customOrder
     }
 
     init(bookSourceUrl: String, bookSourceName: String, searchUrl: String?, ruleSearch: [String: String]? = nil,
@@ -55,11 +56,15 @@ struct LegadoSource: Codable, Hashable, Identifiable {
         enabled = (try? c.decode(Bool.self, forKey: .enabled))
         header = Self.str(c, .header)
         searchUrl = Self.str(c, .searchUrl)
-        exploreUrl = Self.str(c, .exploreUrl)
+        if let entries = try? c.decode([[String: LegadoAny]].self, forKey: .exploreUrl) {
+            let objects = entries.map { $0.compactMapValues(\.text) }
+            exploreUrl = (try? JSONSerialization.data(withJSONObject: objects)).map { String(decoding: $0, as: UTF8.self) }
+        } else { exploreUrl = Self.str(c, .exploreUrl) }
         loginUrl = Self.str(c, .loginUrl)
         loginUi = Self.str(c, .loginUi)
         jsLib = Self.str(c, .jsLib)
         ruleSearch = Self.rules(c, .ruleSearch)
+        ruleExplore = Self.rules(c, .ruleExplore)
         ruleBookInfo = Self.rules(c, .ruleBookInfo)
         ruleToc = Self.rules(c, .ruleToc)
         ruleContent = Self.rules(c, .ruleContent)

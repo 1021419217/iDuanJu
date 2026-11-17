@@ -39,23 +39,11 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         return !stream.url.hasPrefix("tdfile://") && !stream.url.hasPrefix("file://") && LocalHLSProxy.token(of: stream.url) == nil
     }
 
-    /// User-facing failure text. Deliberately short Chinese: dumping NSError.localizedDescription
-    /// ("The operation couldn't be completed. (CoreMediaErrorDomain error -19152.)") stacked several
-    /// lines over the picture and got covered by the centre buttons. Keep a readable cause + the code
-    /// so a device report still pins it.
+    /// User-facing failure text with the AVFoundation code (so a device report pins the cause).
     static func failureText(_ e: Error?) -> String {
         guard let ns = e as NSError? else { return "播放失败，请重试" }
         let under = (ns.userInfo[NSUnderlyingErrorKey] as? NSError).map { " / \($0.code)" } ?? ""
-        let reason: String
-        switch ns.domain {
-        case "CoreMediaErrorDomain":
-            reason = ns.code == -19152 ? "密钥加载超时" : "解码失败"
-        case NSURLErrorDomain:
-            reason = ns.code == NSURLErrorTimedOut ? "连接超时" : "网络错误"
-        default:
-            reason = "播放失败"
-        }
-        return "\(reason)（\(ns.code)\(under)），点重试"
+        return "\(ns.localizedDescription)（\(ns.code)\(under)）"
     }
 
     static let rateSteps: [Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
@@ -75,7 +63,10 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     private(set) var loadedUntil: Double = 0
     /// Buffered position for the progress bar: AVPlayer buffer or the byte pre-buffer, whichever is ahead.
     var bufferedUntil: Double { max(loadedUntil, prebuffer?.until ?? 0) }
-    private(set) var paused = false
+    /// User intent survives buffering, episode replacement and system interruptions.
+    private var wantsPlayback = true
+    private var transportPaused = false
+    var paused: Bool { !wantsPlayback || interrupted || transportPaused || current.flatMap { errors[$0] } != nil }
     /// Active playback rate (1.0 default). Locked rate persists after speed-gesture ends.
     private(set) var playbackRate: Double = 1.0
     /// Non-nil when user locked a non-1x rate via speed gesture.
@@ -164,29 +155,34 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     private(set) var pipActive = false
     var pipError: String?
     private var restoringPiP = false
-    /// 仅当用户点击手动画中画按钮时为 true；用于区分系统后台自动启动。
-    private var userInitiatedPiP = false
     private var backgrounded = false
     private var interrupted = false
+    private var recoverInterruptedTransport = false
     private var audioSessionActive = false
+    private var continuePiP = false
+    @ObservationIgnored private let suppliedEngine: PlayerEngine?
+    @ObservationIgnored private let sourceResolver: ((Int) async throws -> Source)?
 
-    init(series: HGSeries) {
+    init(series: HGSeries, engine: PlayerEngine? = nil, resolve: ((Int) async throws -> Source)? = nil) {
         self.series = series
+        self.suppliedEngine = engine
+        self.sourceResolver = resolve
         let a = AVPlayerEngine()
         self.av = a
-        self.engine = a
+        self.engine = engine ?? a
         super.init()
     }
 
     func start() {
         guard observer == nil else { return }
         let player = av.player
-        // 不创建 MPNowPlayingSession：无灵动岛/锁屏播放标志，也避免它对
-        // AVPlayer.rate 的 KVO 在退出 teardown 时留下悬空观察者（v6 返回闪退根因）。
-        // [merge 2026-11-13] 保留本分支的选择：不建 session。上游此处的
-        // session/remoteCommandCenter 一并略过——遥控命令由 configureRemoteCommands
-        // （Aether 路径）与 AVPlayer 自带通道覆盖。
-        nowPlaying = nil
+        let session = MPNowPlayingSession(players: [player])
+        session.automaticallyPublishesNowPlayingInfo = true
+        nowPlaying = session
+        let commands = session.remoteCommandCenter
+        commands.playCommand.addTarget(self, action: #selector(remotePlay))
+        commands.pauseCommand.addTarget(self, action: #selector(remotePause))
+        commands.togglePlayPauseCommand.addTarget(self, action: #selector(remoteToggle))
         #if DEBUG
         // UI tests: an interruption that never ends (STV_FAKE_INTERRUPT=<seconds after start>).
         if let s = ProcessInfo.processInfo.environment["STV_FAKE_INTERRUPT"].flatMap(Double.init) {
@@ -206,16 +202,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
                 MainActor.assumeIsolated { self?.setPaused(true) }
             }
         })
-        audioObservers.append(center.addObserver(forName: AVPlayer.rateDidChangeNotification, object: player, queue: .main) { [weak self] note in
-            // PiP controls target AVPlayer directly. System background/interruption pauses must not erase play intent.
-            guard note.userInfo?[AVPlayer.rateDidChangeReasonKey] as? String == AVPlayer.RateDidChangeReason.setRateCalled.rawValue else { return }
-            MainActor.assumeIsolated {
-                guard let self, self.engineKind == .avplayer, self.pipActive, !self.restoringPiP, self.readyIndex != nil else { return }
-                // ▶ in the PiP window after an interruption: the user resumed, so drop the stale flag (see setPaused).
-                if self.av.player.rate > 0 { self.interrupted = false; self.activateAudioSession() } else if self.interrupted { return }
-                self.paused = self.av.player.rate == 0
-            }
-        })
+        bindTransportRequests(engine)
         // One clock for both cores (AVPlayer periodic observers do not exist on Aether's software route).
         let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
@@ -223,7 +210,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         RunLoop.main.add(t, forMode: .common)
         timer = t
         observer = t
-        // 不注册锁屏/耳机远程命令：不发布 Now Playing。
+        registerSharedCommands()
     }
 
     /// Lock-screen / headset commands while Aether plays (AVPlayer's own MPNowPlayingSession covers the fallback).
@@ -237,8 +224,14 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     }
 
     private func publishNowPlaying() {
-        // 不发布任何 Now Playing 信息（灵动岛/锁屏不显示播放标志）。
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        guard engineKind == .aether, let i = readyIndex, episodes.indices.contains(i) else { return }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+            MPMediaItemPropertyTitle: detail?.title ?? series.title,
+            MPMediaItemPropertyAlbumTitle: series.source.isLongVideo ? series.source.label : "第\(episodes[i].ep)集",
+            MPMediaItemPropertyPlaybackDuration: duration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: time,
+            MPNowPlayingInfoPropertyPlaybackRate: paused ? 0.0 : playbackRate,
+        ]
     }
 
     private func activateAudioSession() {
@@ -274,25 +267,25 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         }
         nowPlaying = nil
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
-        userInitiatedPiP = false
         if pip?.isPictureInPictureActive == true {
             pip?.stopPictureInPicture()
         }
-        pipObservation = nil
-        pip?.delegate = nil
         pip = nil
         pipIdentity = nil
         pipActive = false
         pipPossible = false
         timer?.invalidate(); timer = nil
         observer = nil
+        engine.onPlaybackRequested = nil
+        suppliedEngine?.stop()
         av.stop()
         aether?.stop()
         readyIndex = nil
         current = nil
         backgrounded = false
         interrupted = false
+        recoverInterruptedTransport = false
+        continuePiP = false
         tasks.values.forEach { $0.cancel() }
         tasks.removeAll()
         prefetchTokens.values.forEach { LocalHLSProxy.shared.release($0) }
@@ -310,133 +303,113 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
 
     /// (Re)build the PiP controller when the active core's picture route changes.
     private func refreshPiP() {
-        // 关键：默认【不创建】任何 AVPictureInPictureController。
-        // 系统只有在手里存在一个 controller 时，才会在 App 进入后台自动拉起画中画；
-        // 既然平时没有，就不可能出现「自动画中画闪一下又消失」。
-        // 手动画中画由 togglePiP() / ensurePiPController() 按需创建。
-        pipPossible = AVPictureInPictureController.isPictureInPictureSupported()
-        guard !userInitiatedPiP, !pipActive else { return }
-        if pip != nil {
-            pipObservation = nil
-            pip?.delegate = nil
-            pip = nil
-            pipIdentity = nil
+        let id = engine.pipIdentity
+        guard id != pipIdentity else { return }
+        guard !pipActive else { return }                 // never swap under a live PiP window
+        pipIdentity = id
+        pipObservation = nil
+        pip?.delegate = nil
+        pip = nil
+        pipPossible = false
+        guard id != nil, AVPictureInPictureController.isPictureInPictureSupported(),
+              let controller = engine.makePiPController() else {
+            cancelPiPHandover()
+            return
         }
-    }
-
-    /// 仅在用户主动点「画中画」按钮时创建 controller；平时系统手里没有 controller。
-    private func ensurePiPController() -> AVPictureInPictureController? {
-        if let pip, pipIdentity == engine.pipIdentity { return pip }
-        guard engine.pipIdentity != nil, AVPictureInPictureController.isPictureInPictureSupported(),
-              let controller = engine.makePiPController() else { return nil }
         controller.delegate = self
-        controller.canStartPictureInPictureAutomaticallyFromInline = false
-        pipIdentity = engine.pipIdentity
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
         pip = controller
-        pipObservation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] c, _ in
+        pipObservation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] controller, _ in
             Task { @MainActor in
-                guard self?.pip === c else { return }
-                self?.pipPossible = AVPictureInPictureController.isPictureInPictureSupported()
+                guard self?.pip === controller else { return }
+                self?.pipPossible = controller.isPictureInPicturePossible
+                if let self, self.continuePiP, self.wantsPlayback, self.readyIndex != nil,
+                   controller.isPictureInPicturePossible, self.backgrounded {
+                    self.continuePiP = false
+                    controller.startPictureInPicture()
+                }
             }
         }
-        return controller
     }
 
     func togglePiP() {
-        // 已开启 → 关闭
-        if let pip, pip.isPictureInPictureActive {
+        guard let pip else { return }
+        if pip.isPictureInPictureActive {
+            continuePiP = false
             restoringPiP = true
             pip.stopPictureInPicture()
-            return
-        }
-        guard let controller = ensurePiPController() else { return }
-        userInitiatedPiP = true
-        if controller.isPictureInPicturePossible {
-            controller.startPictureInPicture()
-        } else {
-            // 刚创建时 isPictureInPicturePossible 可能还没翻上来，稍等再启动一次。
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                guard self.pip === controller, self.userInitiatedPiP,
-                      controller.isPictureInPicturePossible,
-                      !controller.isPictureInPictureActive else {
-                    // 启动不了就复位，避免后台清理逻辑被永久跳过。
-                    if self.pip === controller { self.userInitiatedPiP = false }
-                    return
-                }
-                controller.startPictureInPicture()
-            }
+        } else if pip.isPictureInPicturePossible {
+            pip.startPictureInPicture()
         }
     }
 
+    private func cancelPiPHandover() {
+        guard continuePiP else { return }
+        continuePiP = false
+        engine.setPiPActive(false)
+    }
+
     func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
-        // 只有用户主动点按钮才允许进入画中画。
-        guard userInitiatedPiP else { return }
+        guard controller === pip else { return }
         pipActive = true
         engine.setPiPActive(true)
     }
 
-    func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
-        // 兜底：只拦截「非用户主动」的自动拉起；用户手动开的画中画切后台应继续播放。
-        if !userInitiatedPiP {
-            controller.stopPictureInPicture()
-        }
-    }
-
     func pictureInPictureController(_ controller: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
+        guard controller === pip else { return }
         pipActive = false
-        userInitiatedPiP = false
+        engine.setPiPActive(false)
+        continuePiP = false
         if !backgrounded { pipError = error.localizedDescription }
     }
 
     func pictureInPictureController(_ controller: AVPictureInPictureController,
                                     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completion: @escaping (Bool) -> Void) {
-        // 播放器 UI 本来就在，必须告诉系统「已恢复」。
-        // 回 false 会让系统留下黑屏 + 「返回播放器」的恢复占位界面（v7 的黑屏卡死根因）。
         restoringPiP = true
-        completion(true)
+        completion(controller === pip && observer != nil)
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
+        guard controller === pip else { return }
         pipActive = false
-        engine.setPiPActive(false)
-        userInitiatedPiP = false
-        restoringPiP = false
-        // 任何 PiP 结束都销毁 controller，系统手里没有 controller 就不会再自动拉起。
-        pipObservation = nil
-        pip?.delegate = nil
-        pip = nil
-        pipIdentity = nil
-        // 回前台无条件续播，避免断流。
-        if !backgrounded, !paused, readyIndex != nil {
-            activateAudioSession()
-            play()
+        // A software source or fallback can replace the PiP content during an episode load.
+        // That stop belongs to the handover, not to the user pressing the close button.
+        if continuePiP {
+            // Keep the replacement renderer alive until its own PiP controller starts. Clearing
+            // this flag here can tear down the newly loaded video while still backgrounded.
+            if readyIndex != nil { refreshPiP() }
+        } else {
+            engine.setPiPActive(false)
+            if !restoringPiP { setPaused(true) }
+            else { resumeIfRequested() }
         }
+        restoringPiP = false
     }
 
     func didEnterBackground() {
         backgrounded = true
-        // 保险：确保后台不残留任何 PiP controller（平时本来就没有）。
-        if !userInitiatedPiP {
-            pipObservation = nil
-            pip?.delegate = nil
-            pip = nil
-            pipIdentity = nil
-            pipActive = false
-        }
-        // 显式激活 .playback 音频会话并落盘进度，保证切后台音视频会话不被拆掉。
-        activateAudioSession()
         save(force: true)
     }
 
     func didBecomeActive() {
         guard backgrounded else { return }
         backgrounded = false
-        // 不重建任何 PiP controller；手动画中画按钮会在点击时按需创建。
-        // 重新武装音频会话、清除过期中断标志并无条件续播，避免回前台断流。
-        interrupted = false
-        activateAudioSession()
-        if !paused, readyIndex != nil { play() }
+        audioSessionActive = false
+        continuePiP = false
+        if !pipActive { engine.setPiPActive(false) }
+        if pip?.isPictureInPictureActive == true {
+            restoringPiP = true
+            pip?.stopPictureInPicture()
+        }
+        resumeIfRequested()
+        // Engine foreground restoration may itself be asynchronous. Reconcile once afterwards,
+        // re-reading intent so a pause pressed in the meantime always wins.
+        let token = activation
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard let self, self.activation == token, !self.backgrounded else { return }
+            self.resumeIfRequested()
+        }
     }
 
     private func handleInterruption(_ notification: Notification) {
@@ -444,12 +417,13 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         if type == AVAudioSession.InterruptionType.began.rawValue {
             audioSessionActive = false
             interrupted = true
+            recoverInterruptedTransport = false
             save(force: true)
         } else {
             interrupted = false
             let options = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
             if !AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume) { setPaused(true) }
-            else if !paused, readyIndex != nil { play() }
+            else if wantsPlayback, readyIndex != nil { play() }
         }
     }
 
@@ -474,7 +448,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         let r = Self.nearestStep(rate)
         let clamped = min(r, engine.maxRate)
         playbackRate = clamped
-        if !paused, !interrupted, readyIndex != nil { engine.setRate(clamped) }
+        if wantsPlayback, !interrupted, readyIndex != nil { engine.setRate(clamped) }
     }
 
     func lockRate(_ rate: Double) {
@@ -513,7 +487,8 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     func select(_ index: Int?) {
         guard let index, index != current, episodes.indices.contains(index) else { return }
         current = index
-        paused = false
+        wantsPlayback = true
+        transportPaused = false
         activate(index)
     }
 
@@ -530,18 +505,18 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         activation = token
         if let r = readyIndex, heldFrame == nil, let img = Self.snapshot(engine.surface) { heldFrame = (img, r) }
         readyIndex = nil
+        if pipActive { continuePiP = true }
+        // A source/renderer reload can deactivate the shared session independently of this flag.
+        // The next play must acquire it again rather than trust the previous episode's value.
+        audioSessionActive = false
         engine.pause()
         time = 0; loadedUntil = 0
         duration = Double(episodes[i].duration)
         for k in tasks.keys where k != i && k != i + 1 {
             tasks.removeValue(forKey: k)?.cancel()
         }
-        // iOS 17 兼容：代理路由/预取缓存的释放统一回到主线程同步执行（v10 稳定基线）。
-        // 1.7 曾用 Task.detached 在后台线程调用 LocalHLSProxy.release（内部含 NSLock、
-        // prefetcher.stop、Task{await td.cancel()}），在 Swift 6.2 运行时会触发跨线程
-        // 执行器断言与数据竞争。缓存目录本身已由 PrefetchStore.remove 在后台删除，
-        // 这里同步释放路由不会阻塞主线程。
         for (k, tok) in prefetchTokens where k != i {
+            // Only the playing episode pre-buffers; others drop their proxy route + cache.
             LocalHLSProxy.shared.release(tok); prefetchTokens[k] = nil; prepared[k] = nil
         }
         prebuffer = nil
@@ -552,10 +527,18 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         }
         errors[i] = nil
         verifyTargets[i] = nil
+        let lease = backgrounded || pipActive ? PlaybackBackgroundLease() : nil
         Task { [self] in
+            defer { lease?.end() }
             guard activation == token else { return }
             do {
                 let src = try await prepare(i)
+                #if DEBUG
+                if let delay = ProcessInfo.processInfo.environment["STV_PLAYER_LOAD_DELAY"].flatMap(Double.init), delay > 0 {
+                    try await Task.sleep(for: .seconds(delay))
+                }
+                if ProcessInfo.processInfo.environment["STV_PLAYER_LOAD_ERROR"] == "1" { throw URLError(.cannotOpenFile) }
+                #endif
                 guard activation == token else { return }
                 let next = chooseEngine(i, src)
                 switchEngine(to: next)
@@ -571,7 +554,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
                 }
                 next.onEnded = { [weak self, weak next] in
                     guard let self, let next, self.activation == token, self.engine === next, self.current == i else { return }
-                    if i + 1 < self.episodes.count, self.autoNext { self.select(i + 1) } else { self.setPaused(true) }
+                    if self.wantsPlayback, i + 1 < self.episodes.count, self.autoNext { self.select(i + 1) } else { self.setPaused(true) }
                 }
                 do {
                     try await next.load(src, stream: chosen[i], start: start, title: title)
@@ -588,8 +571,10 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
                 #endif
                 next.muted = muted
                 readyIndex = i
+                if continuePiP { engine.setPiPActive(true) }
                 refreshPiP()
-                if !paused, !interrupted { play() }
+                if wantsPlayback, !interrupted { play() }
+                if pipActive, engine.pipIdentity == pipIdentity { continuePiP = false }
                 if episodes.indices.contains(i + 1) {
                     Task { [weak self] in
                         guard let self, self.activation == token else { return }
@@ -603,17 +588,12 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
                     let next = episodes.indices.filter { $0 > i && $0 <= i + 3 }.map { episodes[$0].vid }
                     Task { await HongguoClient.shared.prefetch(vids: next) }
                 }
-                // 不激活 Now Playing 会话、不发布媒体信息。
+                if engineKind == .avplayer { _ = await nowPlaying?.becomeActiveIfPossible() } else { publishNowPlaying() }
             } catch {
                 guard activation == token else { return }
                 errors[i] = error.localizedDescription
                 verifyTargets[i] = error.verifyTarget
-                // 插件也能请求一次站点验证：E_VERIFY 的 message 是要打开的地址。
-                if verifyTargets[i] == nil, let pe = error as? PluginError,
-                   case .runtime(let code, let msg) = pe, code == "E_VERIFY",
-                   let u = URL(string: msg), u.scheme == "https" {
-                    verifyTargets[i] = VerifyTarget(source: series.source, url: u.absoluteString)
-                }
+                cancelPiPHandover()
             }
         }
     }
@@ -621,6 +601,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     /// Aether unless the user chose the system player, the source needs AVPlayer (resource-loader AES,
     /// FairPlay), Aether could not be created, or it already failed on this episode.
     private func chooseEngine(_ i: Int, _ src: Source) -> PlayerEngine {
+        if let suppliedEngine { return suppliedEngine }
         guard PlayerEngineSettings.preferred == .aether, !aetherFailed.contains(i),
               let a = aether, a.supports(src) else { return av }
         return a
@@ -629,10 +610,12 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     private func switchEngine(to next: PlayerEngine) {
         if next !== engine {
             engine.onFailed = nil; engine.onEnded = nil
+            engine.onPlaybackRequested = nil
             engine.stop()
             engine = next
         }
         engine.fill = fill
+        bindTransportRequests(engine)
         if engineKind != next.kind { engineKind = next.kind }
     }
 
@@ -662,6 +645,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         prepared[i] = nil
         chosen[i] = nil
         errors[i] = Self.failureText(error)
+        cancelPiPHandover()
     }
 
     /// What the video surface shows right now (Metal / sample-buffer layers included).
@@ -702,6 +686,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     }
 
     private func prepare(_ i: Int) async throws -> Source {
+        if let sourceResolver { return try await sourceResolver(i) }
         if let source = prepared[i] {
             if case .file(let url) = source, !FileManager.default.fileExists(atPath: url.path) {
                 prepared[i] = nil
@@ -749,23 +734,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
                 guard let u = URL(string: s.url) else { throw ProviderError.invalid(s.url) }
                 return .remote(u, s.headers)
             case .mp4Clear, .hls, .hlsAES:
-                // 插件源的渐进式 MP4 不走本地代理：代理要自己处理 Range/长度探测，实测会给出截断的
-                // 响应（91porn 表现为时长只有 5 秒、黑屏），并让切换线路时卡住主线程。
-                // 内置源（红果/hanime1/supjav/eporner/xvideos）保持原样，避免影响已验证可用的路径。
-                if s.kind == .mp4Clear, series.source.rawValue.hasPrefix("p.") {
-                    guard let u = URL(string: s.url) else { throw ProviderError.invalid(s.url) }
-                    return .remote(u, s.headers)
-                }
                 let budget = bypass ? 0 : BufferSettings.budget(for: series.source)
-                // 黄果 AES-128：key 由我们带全套 headers 自己取。走 LocalHLSProxy 的 /r 代理，
-                // 或让 AVFoundation 裸取 playlist 里的 key URI，换线路后都会 -19152（加密密钥
-                // 加载超时，真机 2026-11-13）。统一交给 HLSPlayback：playlist 与 key 都经它的
-                // resourceLoader，带 Referer / User-Agent / x-cdn-auth，且 key 永不留成裸 https。
-                if series.source == .huangguo, s.kind == .hls || s.kind == .hlsAES {
-                    STVLog.w("route hg->HLSPlayback kind=\(s.kind) key=\(s.key.count) idx=\(i)")
-                    return .stream(HLSPlayback(headers: s.headers, keyHex: s.key), s.url)
-                }
-                STVLog.w("route kind=\(s.kind) src=\(series.source.rawValue) budget=\(budget) aether=\(viaAether) key=\(s.key.count)")
                 if budget > 0, let proxied = await self?.prebuffered(s, budget: budget, index: i) { return proxied }
                 if viaAether, s.kind != .mp4Clear, s.key.isEmpty {
                     // Aether hands HLS to AVPlayer on a URL: keep our playlist rewriting (ad-strip, headers,
@@ -835,7 +804,6 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
 
     func choose(_ s: HGStream, for i: Int) {
         guard chosen[i] != s else { return }
-        // iOS 17 兼容：回到主线程同步释放（同 activate），避免 Task.detached 跨线程访问代理状态。
         if let tok = prefetchTokens.removeValue(forKey: i) { LocalHLSProxy.shared.release(tok) }
         tasks.removeValue(forKey: i)?.cancel()
         chosen[i] = s; prepared[i] = nil
@@ -846,33 +814,52 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
 
     func togglePause() {
         // Interrupted: playback is already stopped whatever the button shows, so this tap means ▶.
-        setPaused(interrupted ? false : !paused)
+        let failed = current.flatMap { errors[$0] } != nil
+        setPaused(failed || interrupted || (readyIndex != nil && engine.isPaused && !engine.isWaiting) ? false : wantsPlayback)
     }
 
     private func setPaused(_ value: Bool) {
-        paused = value
+        let wasInterrupted = interrupted
+        if !value {
+            interrupted = false
+            if wasInterrupted { recoverInterruptedTransport = true; audioSessionActive = false }
+        } else { recoverInterruptedTransport = false }
+        wantsPlayback = !value
+        transportPaused = value
+        if value { continuePiP = false }
         if value {
             engine.pause()
             save(force: true)
         } else if readyIndex != nil {
             // An explicit play wins over a stale interruption: iOS does not promise an `.ended` (another app's
             // audio, PiP interrupted by another app), and waiting for it left ▶ dead until the player was reopened.
-            let wasInterrupted = interrupted
-            interrupted = false
             if duration > 0, engine.currentTime >= duration - 0.15, engine.kind == .avplayer { seek(fraction: 0) }
-            if wasInterrupted, let a = engine as? AetherPlayerEngine {
-                activateAudioSession()
-                a.playThroughInterruption(rate: min(playbackRate, engine.maxRate))
-            } else {
-                play()
-            }
+            play()
+        } else if let current, errors[current] != nil {
+            activate(current)
         }
         publishNowPlaying()
     }
 
     private func play() {
         activateAudioSession()
-        engine.play(rate: min(playbackRate, engine.maxRate))
+        let rate = min(playbackRate, engine.maxRate)
+        let recover = recoverInterruptedTransport
+        recoverInterruptedTransport = false
+        if recover, let a = engine as? AetherPlayerEngine { a.playThroughInterruption(rate: rate) }
+        else { engine.play(rate: rate) }
+    }
+
+    private func bindTransportRequests(_ target: PlayerEngine) {
+        target.onPlaybackRequested = { [weak self, weak target] playing in
+            guard let self, let target, self.engine === target, !self.restoringPiP, self.readyIndex != nil else { return }
+            self.setPaused(!playing)
+        }
+    }
+
+    private func resumeIfRequested() {
+        guard wantsPlayback, !interrupted, readyIndex != nil, engine.isPaused else { return }
+        play()
     }
 
     func setMuted(_ on: Bool) {
@@ -944,6 +931,8 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         guard t.isFinite else { return }
         time = t
         let waiting = engine.isWaiting
+        let stopped = engine.isPaused && !waiting
+        if stopped != transportPaused { transportPaused = stopped }
         if waiting != waitingForMedia { waitingForMedia = waiting }
         let d = engine.duration
         if d.isFinite, d > 0, abs(d - duration) > 0.01 { duration = d }

@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 enum HomeTab: Hashable {
     case hongguo(HGRankGenre)
@@ -60,20 +59,10 @@ enum HomeSource: Hashable, Identifiable {
         case .channels, .manga, .novel: []
         }
     }
-    /// 当前页面对应的搜索站源：在首页搜索时直接搜这个源，而不是全局。
-    /// 频道 / 漫画 / 小说 没有对应的影视站源，返回 nil（走全局搜索）。
-    var searchSource: DramaSource? {
-        switch self {
-        case .site(let s): s
-        case .hongguo, .ai: .hongguo
-        case .huangguo: .huangguo
-        case .channels, .manga, .novel: nil
-        }
-    }
     @MainActor static var all: [HomeSource] {
         let g = SourceGate.shared
-        // Telegram 频道已按用户要求下线（不用它的 API），不再出现在站源栏
-        return [.hongguo] + (g.showHuangguo ? [.huangguo] : []) + [.ai] + g.visibleSites.map { .site($0) } + [.manga, .novel]
+        // 本构建不含小说模块：从首页源列表移除小说入口（代码保留以免破坏编译依赖）。
+        return [.hongguo] + (g.showHuangguo ? [.huangguo] : []) + [.ai] + g.visibleSites.map { .site($0) } + [.channels, .manga]
     }
 }
 
@@ -103,16 +92,12 @@ struct HomeView: View {
     @State private var source: HomeSource
     @State private var subs: [HomeSource: HomeTab]
     @State private var heroCovers: [HomeSource: String] = [:]
-    /// Header text sits on the blurred hero poster (dark) when there is one, else on the page colour.
-    private var onPoster: Bool { heroCovers[source] != nil }
-    private var headerInk: Color { onPoster ? .white : STVTheme.text }
+    /// ui-redesign 10/11: the header always sits on the page colour (ambient glow on top); once the current page
+    /// scrolls it pins with a blurred 80 % page-colour ground and a hairline.
+    private var headerInk: Color { STVTheme.text }
+    @State private var scrolled: [HomeSource: Bool] = [:]
+    private var pinned: Bool { scrolled[source] ?? false }
     @State private var showChannels = false
-    /// 频道面板自己的副本：拖动时先在这里重排，松手才写进 SourceOrder，避免中途闪烁。
-    @State private var panelItems: [HomeSource] = []
-    @State private var editingSources = false
-    @State private var draggingSource: HomeSource?
-    /// 自定义顺序 / 隐藏之后真正展示的站源。
-    private var sources: [HomeSource] { SourceOrder.shared.arrange(HomeSource.all) }
 
     init() {
         let e = ProcessInfo.processInfo.environment["STV_HOME_TAB"] ?? ""
@@ -134,7 +119,7 @@ struct HomeView: View {
         VStack(spacing: 0) {
             header
             TabView(selection: $source) {
-                ForEach(sources) { s in
+                ForEach(HomeSource.all) { s in
                     if s == .channels {
                         ChannelFeedView(embedded: true).tag(s)
                     } else if s == .manga {
@@ -144,59 +129,50 @@ struct HomeView: View {
                     } else {
                         HomeFeedPage(source: s,
                                      tab: Binding(get: { subs[s] ?? s.subs[0] }, set: { subs[s] = $0 }),
-                                     onHero: { heroCovers[s] = $0 })
+                                     onHero: { heroCovers[s] = $0 },
+                                     onScrolled: { v in if scrolled[s] != v { scrolled[s] = v } })
                             .tag(s)
                     }
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
         }
-        .background(alignment: .top) { atmosphere }
-        .background(STVTheme.bg.ignoresSafeArea())
+        .dsAmbient(visible: !pinned)
         .toolbar(.hidden, for: .navigationBar)
         .sheet(isPresented: $showChannels) { channelPanel }
         .onChange(of: SourceGate.shared.visibleSites) { _, _ in if !HomeSource.all.contains(source) { source = .hongguo } }
-        // 站源被移除后 selection 会指向一个不存在的 tag，TabView 会空白，这里兜到第一个可见源。
-        .onChange(of: sources) { _, list in
-            if !list.contains(source), let first = list.first { source = first }
-        }
-        // 首次进入就要兜一次：如果用户在设置里把红果删了，init 里的默认值已经不在列表里，
-        // 只靠 onChange 不会触发（sources 没有变化），首页会是一片空白。
-        .onAppear {
-            if !sources.contains(source), let first = sources.first { source = first }
-        }
     }
 
     // MARK: Header (search + filter, source bar)
 
     private var header: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 0) {
             HStack(spacing: 0) {
-                NavigationLink(value: source.searchSource.map { Route.searchIn($0) } ?? Route.search) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "magnifyingglass").font(.system(size: 18, weight: .medium))
-                        Text("搜索你想看的作品").font(.system(size: 16)).opacity(0.8).lineLimit(1)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.leading, 14).frame(height: 44).contentShape(Rectangle())
+                NavigationLink(value: Route.search) {
+                    DSSearchBarLabel()
+                        .padding(.leading, 16).frame(height: 46).contentShape(Rectangle())
                 }.buttonStyle(.plain).accessibilityIdentifier("home.search")
                 Button { showChannels = true } label: {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 5) {
                         Image(systemName: "line.3.horizontal.decrease").font(.system(size: 14, weight: .semibold))
                         Text("筛选").font(.system(size: 14, weight: .medium))
                     }
-                    .padding(.horizontal, 14).frame(height: 44).contentShape(Rectangle())
-                }.buttonStyle(.plain).accessibilityLabel("筛选与全部频道").accessibilityIdentifier("home.filter")
+                    .foregroundStyle(STVTheme.text)
+                    .padding(.horizontal, 16).frame(height: 46).contentShape(Rectangle())
+                }.buttonStyle(PressScale()).accessibilityLabel("筛选与全部频道").accessibilityIdentifier("home.filter")
             }
-            .foregroundStyle(headerInk)
-            .background(headerInk.opacity(onPoster ? 0.18 : 0.07), in: Capsule())
-            .background(.ultraThinMaterial.opacity(0.6), in: Capsule())
-            .overlay { Capsule().strokeBorder(headerInk.opacity(0.14), lineWidth: 1) }
+            .background(STVTheme.glass, in: Capsule())
+            .overlay { Capsule().strokeBorder(STVTheme.glassBorder, lineWidth: 1) }
             .padding(.horizontal, 16)
-            HomeChannelBar(items: sources, selection: $source, label: \.label, ink: headerInk) { showChannels = true }
-                .padding(.leading, 16)
+            HomeChannelBar(items: HomeSource.all, selection: $source, label: \.label, ink: headerInk) { showChannels = true }
+                .padding(.leading, 20)
+                .padding(.top, pinned ? 14 : 18)
         }
-        .padding(.top, 6)
+        .padding(.top, 8)
+        .padding(.bottom, pinned ? 10 : 0)
+        .dsPinned(pinned)
+        .animation(.easeOut(duration: 0.22), value: pinned)
+        .zIndex(1)
     }
 
     /// 当前来源页 hero 海报模糊铺在页面顶部，向页面底色淡出。
@@ -223,50 +199,22 @@ struct HomeView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    // 站源：固定 3 列。点格子只切站源、不关面板，下面的「子频道」跟着换；
-                    // 长按可拖动排序，点标题右侧的排序按钮后每个格子右上角出现 × 可移除。
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack(spacing: 8) {
-                            Text("站源").font(.subheadline.weight(.semibold)).foregroundStyle(STVTheme.secondary)
-                            Spacer(minLength: 0)
-                            Button {
-                                withAnimation(.snappy(duration: 0.22)) { editingSources.toggle() }
-                            } label: {
-                                Image(systemName: editingSources ? "checkmark" : "arrow.up.arrow.down")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(editingSources ? STVTheme.accent : STVTheme.secondary)
-                                    .frame(width: 28, height: 28)
-                                    .background(editingSources ? STVTheme.accent.opacity(0.14) : STVTheme.glass, in: Circle())
+                    ForEach(HomeSource.all.filter { !$0.subs.isEmpty }) { s in
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(s.label).font(.subheadline.weight(.semibold)).foregroundStyle(STVTheme.secondary)
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 10)], spacing: 10) {
+                                ForEach(s.subs, id: \.self) { t in
+                                    let on = s == source && (subs[s] ?? s.subs[0]) == t
+                                    Button { subs[s] = t; source = s; showChannels = false } label: {
+                                        Text(t.subLabel).font(.subheadline.weight(on ? .semibold : .regular))
+                                            .foregroundStyle(on ? STVTheme.accent : STVTheme.text)
+                                            .frame(maxWidth: .infinity).frame(height: 40)
+                                            .background(on ? STVTheme.accent.opacity(0.14) : STVTheme.glass,
+                                                        in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                    }.buttonStyle(.plain).accessibilityIdentifier("panel.\(s.label).\(t.subLabel)")
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(editingSources ? "完成站源排序" : "排序或移除站源")
-                            .accessibilityIdentifier("panel.source.edit")
                         }
-                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3), spacing: 12) {
-                            ForEach(panelItems) { s in sourceCell(s) }
-                        }
-                        if editingSources {
-                            Text("长按拖动排序 · 点 × 移除 · 移除后可恢复默认")
-                                .font(.caption2).foregroundStyle(STVTheme.secondary)
-                                .transition(.opacity)
-                        }
-                    }
-                    // 频道面板里不再画「子频道」：首页每个站源自己的分类条（subChips）已经够用，
-                    // 这里再列一排只是把同一个分类重复一次。子频道状态 subs 保留，供首页绑定。
-                    if !SourceOrder.shared.hidden.isEmpty {
-                        Button {
-                            withAnimation(.snappy(duration: 0.22)) {
-                                SourceOrder.shared.reset()
-                                syncPanel()
-                            }
-                        } label: {
-                            Text("恢复全部站源").font(.footnote.weight(.medium))
-                                .foregroundStyle(STVTheme.accent)
-                                .frame(maxWidth: .infinity).frame(height: 36)
-                                .background(STVTheme.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityIdentifier("panel.source.reset")
                     }
                 }.padding(20)
             }
@@ -274,105 +222,9 @@ struct HomeView: View {
             .navigationTitle("频道").navigationBarTitleDisplayMode(.inline)
             .accessibilityIdentifier("home.channelPanel")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showChannels = false } } }
-            .onAppear { syncPanel() }
-            .onChange(of: SourceGate.shared.visibleSites) { _, _ in syncPanel() }
-            .onChange(of: draggingSource) { _, v in
-                // 拖到面板外被系统取消时 drop 回调不会来，浮起状态会一直留着，这里兜底复位。
-                guard v != nil else { return }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
-                    if draggingSource == v { withAnimation(.snappy) { draggingSource = nil } }
-                }
-            }
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
-    }
-
-    /// 站源格子：选中态描边、拖动时浮起、排序态右上角 ×。
-    @ViewBuilder private func sourceCell(_ s: HomeSource) -> some View {
-        let on = s == source
-        let lifted = draggingSource == s
-        Button {
-            guard !editingSources else { return }
-            withAnimation(.snappy(duration: 0.2)) { source = s }
-            // 只有一路子频道的源（长视频站 / 漫画 / 小说）点完就关，少一步「完成」。
-            if s.subs.count <= 1 { showChannels = false }
-        } label: {
-            Text(s.label).font(.subheadline.weight(on ? .semibold : .regular))
-                .foregroundStyle(on ? STVTheme.accent : STVTheme.text)
-                .lineLimit(1).minimumScaleFactor(0.7)
-                .frame(maxWidth: .infinity).frame(height: 40)
-                .background(on ? STVTheme.accent.opacity(0.14) : STVTheme.glass,
-                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(on ? STVTheme.accent.opacity(0.45) : Color.clear, lineWidth: 1)
-                }
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("panel.source.\(s.label)")
-        .overlay(alignment: .topTrailing) {
-            if editingSources {
-                Button { removeSource(s) } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(Color.white, Color(red: 0.86, green: 0.30, blue: 0.30))
-                        .font(.system(size: 17))
-                        .background(Circle().fill(STVTheme.surface).padding(1.5))
-                }
-                .buttonStyle(.plain)
-                .offset(x: 6, y: -6)
-                .accessibilityLabel("移除 \(s.label)")
-                .accessibilityIdentifier("panel.source.remove.\(s.label)")
-            }
-        }
-        .scaleEffect(lifted ? 1.06 : 1)
-        .opacity(lifted ? 0.92 : 1)
-        .shadow(color: .black.opacity(lifted ? 0.30 : 0), radius: 12, y: 5)
-        .zIndex(lifted ? 2 : 0)
-        .onDrag {
-            withAnimation(.snappy(duration: 0.16)) { draggingSource = s }
-            return NSItemProvider(object: s.storeKey as NSString)
-        }
-        .onDrop(of: [.text], delegate: SourceDropDelegate(item: s, items: $panelItems,
-                                                          dragging: $draggingSource,
-                                                          onCommit: { SourceOrder.shared.setOrder(panelItems.map(\.storeKey)) }))
-    }
-
-    private func removeSource(_ s: HomeSource) {
-        withAnimation(.snappy(duration: 0.2)) { panelItems.removeAll { $0 == s } }
-        SourceOrder.shared.hide(s)
-        if source == s { source = panelItems.first ?? .hongguo }
-    }
-
-    private func syncPanel() {
-        let list = SourceOrder.shared.arrange(HomeSource.all)
-        if panelItems != list { panelItems = list }
-    }
-}
-
-/// 3 列网格里的长按拖动排序：拖到某个格子上面时，把被拖的项插到它前/后。
-private struct SourceDropDelegate: DropDelegate {
-    let item: HomeSource
-    @Binding var items: [HomeSource]
-    @Binding var dragging: HomeSource?
-    let onCommit: () -> Void
-
-    func dropEntered(info: DropInfo) {
-        guard let d = dragging, d != item,
-              let from = items.firstIndex(of: d),
-              let to = items.firstIndex(of: item), from != to else { return }
-        withAnimation(.snappy(duration: 0.2)) {
-            items.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
-        }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
-
-    func performDrop(info: DropInfo) -> Bool {
-        dragging = nil
-        onCommit()
-        return true
     }
 }
 
@@ -381,10 +233,12 @@ private struct HomeFeedPage: View {
     let source: HomeSource
     @Binding var tab: HomeTab
     var onHero: (String) -> Void
+    var onScrolled: (Bool) -> Void = { _ in }
     @State private var legacyChannels: [HuangguoChannel] = []
     @State private var legacyError: Error?
     @State private var heroIndex = 0
     private let cache = BoardCache.shared
+    private let library = LibraryStore.shared
     private let gutter: CGFloat = 16
     /// DEBUG `STV_HOME_SCROLL=bottom` opens the feed scrolled to the end (simulator screenshots).
     private static var debugAnchor: UnitPoint? {
@@ -395,22 +249,37 @@ private struct HomeFeedPage: View {
     }
 
     var body: some View {
+        if case .site(let source) = tab, source.cmsKey != nil || source.pluginID != nil {
+            DynamicSiteFeed(source: source, onHero: onHero)
+        } else {
+            rankFeed
+        }
+    }
+
+    private var rankFeed: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 if source.subs.count > 1 { subChips } else if case .site = source { boardChips }
                 if tab == .actorRank {
                     ActorRankList().padding(.vertical, 8)
                 } else {
-                    VStack(alignment: .leading, spacing: 28) {
-                        if !heroPicks.isEmpty {
-                            PosterHero(board: boards.first?.title ?? "", picks: heroPicks, index: $heroIndex).id(tab).padding(.horizontal, gutter)
-                        }
-                        sections
-                    }.padding(.top, 4)
+                    if !heroPicks.isEmpty {
+                        PosterHero(board: boards.first?.title ?? "", picks: heroPicks, index: $heroIndex).id(tab).padding(.horizontal, gutter)
+                            .padding(.top, 16)
+                            .transition(.opacity)
+                    }
+                    if source == .hongguo, !library.continueWatching.isEmpty {
+                        HomeContinueRow(items: library.continueWatching).padding(.top, 24)
+                    }
+                    sections
                 }
             }
             .padding(.bottom, 24)
+            .animation(.easeOut(duration: 0.25), value: heroPicks.isEmpty)
+            // iOS 17 兼容：替代 onScrollGeometryChange 读已滚动距离。
+            .readScrollOffset("homeFeed") { y in onScrolled(y > 4) }
         }
+        .coordinateSpace(name: "homeFeed")
         .scrollIndicators(.hidden)
         .defaultScrollAnchor(Self.debugAnchor)
         .accessibilityIdentifier("home.page.\(source.label)")
@@ -427,25 +296,11 @@ private struct HomeFeedPage: View {
     private var heroKey: String { (heroPicks.indices.contains(heroIndex) ? heroPicks[heroIndex].cover : "") + "\(heroIndex)" }
     private func reportHero() { if heroPicks.indices.contains(heroIndex) { onHero(heroPicks[heroIndex].cover) } }
 
+    /// ui-redesign 10: secondary boards are the same glass segmented control as 找剧.
     private var subChips: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(source.subs, id: \.self) { t in
-                    let on = t == tab
-                    Button { withAnimation(.snappy) { tab = t } } label: {
-                        Text(t.subLabel).font(.system(size: 13, weight: on ? .semibold : .regular))
-                            .foregroundStyle(on ? STVTheme.bg : STVTheme.text.opacity(0.8))
-                            .padding(.horizontal, 12).frame(height: 30)
-                            .background(on ? STVTheme.text : STVTheme.text.opacity(0.1), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("home.sub.\(t.subLabel)")
-                    .accessibilityAddTraits(on ? .isSelected : [])
-                }
-            }.padding(.horizontal, gutter)
-        }
-        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-        .padding(.top, 4).padding(.bottom, 12)
+        SegmentedTabs(items: source.subs, selection: $tab, label: \.subLabel, idPrefix: "home.sub")
+            .padding(.horizontal, gutter)
+            .padding(.top, 18)
     }
 
     /// Long-video site pages: same chip row height as 红果/黄果 (top never jumps); each chip opens that board.
@@ -453,19 +308,15 @@ private struct HomeFeedPage: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(Array(boards.enumerated()), id: \.element.id) { i, b in
-                    NavigationLink(value: Route.board(b)) {
-                        Text(b.title).font(.system(size: 13, weight: i == 0 ? .semibold : .regular))
-                            .foregroundStyle(i == 0 ? STVTheme.bg : STVTheme.text.opacity(0.8))
-                            .padding(.horizontal, 12).frame(height: 30)
-                            .background(i == 0 ? STVTheme.text : STVTheme.text.opacity(0.1), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
+                    NavigationLink(value: Route.board(b)) { Text(b.title) }
+                    .buttonStyle(ToneChipStyle(on: i == 0, neutral: true))
                     .accessibilityIdentifier("home.sub.\(b.title)")
                 }
             }.padding(.horizontal, gutter)
         }
         .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-        .padding(.top, 4).padding(.bottom, 12)
+        .mask(FadeMask())
+        .padding(.top, 18)
     }
 
     // MARK: Data
@@ -491,7 +342,7 @@ private struct HomeFeedPage: View {
             if let legacyError { ErrorStateView(error: legacyError) { Task { await loadLegacy() } } }
             else { cardsSkeleton }
         } else {
-            if case .site = tab, let e = boards.lazy.compactMap({ cache.errors[$0.id] }).first(where: { $0.verifyTarget != nil }) {
+            if let e = boards.lazy.compactMap({ cache.errors[$0.id] }).first(where: { $0.verifyTarget != nil }) {
                 ErrorStateView(error: e) { boards.forEach { cache.load($0, force: true) } }
             }
             ForEach(Array(boards.enumerated()), id: \.element.id) { n, b in
@@ -500,17 +351,17 @@ private struct HomeFeedPage: View {
                         // 第一个榜单一律跳过 hero 里已展示的剧（数据不够时也跳过，只剩标题和「全部」）。
                         let heroIds = Set(heroPicks.map(\.id))
                         let rest = n == 0 ? items.filter { !heroIds.contains($0.id) } : items
-                        HomeSection(title: b.title, note: nil, items: Array(rest.prefix(HomeSection.count(for: rest))), more: b)
+                        HomeShelf(title: b.title, note: nil, items: Array(rest.prefix(12)), more: b)
                     } else if cache.failed.contains(b.id) {
-                        HomeSection(title: b.title, note: "加载失败，下拉重试", items: [], more: b)
+                        HomeShelf(title: b.title, note: cache.errors[b.id]?.verifyTarget != nil ? "需要验证，点上方「去验证」" : "加载失败，下拉重试", items: [], more: b)
                     } else {
                         VStack(alignment: .leading, spacing: 12) {
-                            Text(b.title).font(.system(size: 17, weight: .bold)).foregroundStyle(STVTheme.text)
-                            cardsSkeleton
+                            DSSectionHeader(title: b.title)
+                            cardsSkeleton.padding(.horizontal, gutter)
                         }
                     }
                 }
-                .padding(.horizontal, gutter)
+                .padding(.top, n == 0 && heroPicks.isEmpty && library.continueWatching.isEmpty ? 18 : 24)
                 .onAppear { cache.load(b) }
             }
         }
@@ -530,6 +381,109 @@ private struct HomeFeedPage: View {
 
     private func loadLegacy() async {
         do { legacyChannels = try await HuangguoClient.shared.legacyChannels(); legacyError = nil } catch { legacyError = error }
+    }
+}
+
+/// CMS / JS plugin home: every returned category is a selectable module, and the selected one pages its own list.
+private struct DynamicSiteFeed: View {
+    let source: DramaSource
+    var onHero: (String) -> Void
+    @State private var categories: [SiteCategory] = []
+    @State private var selected = ""
+    @State private var pager = Pager()
+    @State private var heroCover: String?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                if categories.count > 1 { chips }
+                if let e = pager.error, pager.items.isEmpty {
+                    ErrorStateView(error: e) { reload(selected) }
+                } else if pager.items.isEmpty && pager.isLoading {
+                    cardsSkeleton.padding(.horizontal, 16)
+                } else if pager.items.isEmpty {
+                    ContentUnavailableView("该分类暂无内容", systemImage: "rectangle.stack", description: Text("部分采集站的父分类不直接提供资源，请选择动作片、国产剧等具体分类。"))
+                } else {
+                    NumberedGrid(items: pager.items, numbered: false, hasMore: pager.hasMore, loading: pager.isLoading) { pager.loadMore() }
+                }
+            }
+            .padding(.vertical, 8)
+        }
+        .scrollIndicators(.hidden)
+        .accessibilityIdentifier("home.page.\(source.label)")
+        .refreshable { await refresh() }
+        .task { await refresh() }
+        .onChange(of: heroCover) { _, cover in if let cover { onHero(cover) } }
+    }
+
+    private var chips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(categories) { c in
+                    let on = c.id == selected
+                    Button { selected = c.id; reload(c.id) } label: {
+                        Text(c.title).font(.system(size: 13, weight: on ? .semibold : .regular))
+                            .foregroundStyle(on ? STVTheme.bg : STVTheme.text.opacity(0.8))
+                            .padding(.horizontal, 12).frame(height: 30)
+                            .background(on ? STVTheme.text : STVTheme.text.opacity(0.1), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("home.module.\(c.title)")
+                    .accessibilityAddTraits(on ? .isSelected : [])
+                }
+            }.padding(.horizontal, 16)
+        }
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        .padding(.bottom, 4)
+    }
+
+    private var cardsSkeleton: some View {
+        LazyVGrid(columns: HomeSection.columns(landscape: source.isLongVideo), spacing: 16) {
+            ForEach(0..<(source.isLongVideo ? 2 : 3), id: \.self) { _ in
+                VStack(alignment: .leading, spacing: 8) {
+                    ShimmerBlock().aspectRatio(source.isLongVideo ? 16/9 : 3/4, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    ShimmerBlock().frame(height: 12).frame(maxWidth: 90)
+                }
+            }
+        }
+    }
+
+    private func refresh() async {
+        let loaded = await Self.loadCategories(source)
+        categories = loaded
+        let id = loaded.contains { $0.id == selected } ? selected : (loaded.first?.id ?? "")
+        selected = id
+        reload(id)
+    }
+
+    private func reload(_ id: String) {
+        let source = source
+        pager.reset { prev, _ in
+            guard let provider = Sites.provider(source) else { throw ProviderError.unsupported(source.label) }
+            let category = SiteCategory(id: id, title: "", path: id)
+            let page = try await provider.list(category, page: max(1, prev.nextOffset ?? 1))
+            if (prev.nextOffset ?? 1) <= 1, let cover = page.items.first?.cover, !cover.isEmpty {
+                await MainActor.run { heroCover = cover }
+            }
+            return page
+        }
+    }
+
+    private static func loadCategories(_ source: DramaSource) async -> [SiteCategory] {
+        if let key = source.cmsKey {
+            var stored = CMSStore.site(key)?.categories ?? []
+            if let site = CMSStore.site(key), let fresh = try? await MacCMSProvider.fetchCategories(api: site.api), !fresh.isEmpty {
+                stored = fresh
+                await MainActor.run { CMSStore.shared.cacheCategories(key, fresh) }
+            }
+            let latest = SiteCategory(id: "", title: "最新", path: "")
+            return [latest] + stored.map { SiteCategory(id: $0.id, title: $0.name, path: $0.id) }
+        }
+        let fallback = SiteCategory(id: "", title: "推荐", path: "")
+        guard let provider = Sites.provider(source) else { return [fallback] }
+        let categories = provider.categories.filter { !$0.id.isEmpty }
+        return [fallback] + categories
     }
 }
 
@@ -561,18 +515,12 @@ struct HomeChannelBar<T: Hashable>: View {
         HStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .center, spacing: 22) {
+                    HStack(alignment: .lastTextBaseline, spacing: 22) {
                         ForEach(items, id: \.self) { it in
                             let on = it == selection
-                            Button { withAnimation(.snappy) { selection = it } } label: {
-                                Text(label(it))
-                                    .font(.system(size: on ? 20 : 17, weight: on ? .bold : .regular))
-                                    .foregroundStyle(on ? ink : ink.opacity(0.62))
-                                    .frame(minHeight: 44)
-                                    .overlay(alignment: .bottom) {
-                                        if on { Capsule().fill(STVTheme.accent).frame(width: 18, height: 3).offset(y: -2)
-                                                .matchedGeometryEffect(id: "indicator", in: ns) }
-                                    }
+                            Button { withAnimation(DS.select) { selection = it } } label: {
+                                UnderlineTabLabel(title: label(it), on: on, ink: ink, inkOff: STVTheme.secondary, ns: ns)
+                                    .frame(minHeight: 40, alignment: .bottom)
                             }.buttonStyle(.plain).id(it).accessibilityIdentifier("home.channel.\(label(it))")
                                 .accessibilityAddTraits(on ? .isSelected : [])
                         }
@@ -587,10 +535,10 @@ struct HomeChannelBar<T: Hashable>: View {
             }
             Button(action: onExpand) {
                 Image(systemName: "chevron.down").font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(ink.opacity(0.85)).frame(width: 44, height: 44)
+                    .foregroundStyle(STVTheme.secondary).frame(width: 44, height: 40)
             }.buttonStyle(.plain).accessibilityLabel("展开全部频道").accessibilityIdentifier("home.expand")
         }
-        .padding(.top, 6).padding(.bottom, 8)
+        .frame(height: 40)
     }
 }
 
@@ -612,11 +560,11 @@ private struct PosterHero: View {
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
         // Same card height for every source so switching pages never makes the top jump.
-        .frame(height: Self.height)
+        .frame(height: height)
         .background { backdrop }
         .overlay(alignment: .bottomTrailing) { dots }
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay { RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(STVTheme.glassBorder, lineWidth: 1) }
+        .shadow(color: .black.opacity(0.22), radius: 15, y: 14)
         // Auto-advance; the timer restarts on every page change, so a manual swipe gets a full 6 s.
         .task(id: "\(picks.count)-\(index)") {
             guard picks.count > 1, Self.autoAdvance else { return }
@@ -626,7 +574,12 @@ private struct PosterHero: View {
         }
     }
 
-    static let height: CGFloat = 228
+    /// `.hero`: 14 pt padding around a 112 pt 3:4 poster (landscape sites: 16:9 at 176 pt).
+    private static let pad: CGFloat = 14
+    private static let posterHeight: CGFloat = 112 * 4 / 3
+    private static let landscapeHeight: CGFloat = pad + 99 + pad + 62
+    private static let portraitHeight: CGFloat = pad + posterHeight + pad
+    private var height: CGFloat { landscape ? Self.landscapeHeight : Self.portraitHeight }
     /// DEBUG `STV_HERO_STILL=1` (UI tests) disables auto-advance so taps never race a page change.
     static var autoAdvance: Bool {
         #if DEBUG
@@ -636,107 +589,92 @@ private struct PosterHero: View {
     }
     private var landscape: Bool { picks.first?.isLandscapeCover ?? false }
 
+    /// Poster colours: the current cover blurred, darkened toward the bottom-right like the spec's gradient card.
     private var backdrop: some View {
         let url = picks.indices.contains(index) ? picks[index].cover : ""
         return ZStack {
-            STVTheme.surface
-            CoverView(url: url, corner: 0).blur(radius: 36).scaleEffect(1.3).opacity(0.7).id(url).transition(.opacity)
-            LinearGradient(colors: [.black.opacity(0.15), .black.opacity(0.55)], startPoint: .leading, endPoint: .trailing)
+            Color(red: 0.14, green: 0.10, blue: 0.10)
+            CoverView(url: url, corner: 0).blur(radius: 40).scaleEffect(1.5).opacity(0.85).id(url).transition(.opacity)
+            LinearGradient(colors: [.black.opacity(0.18), .black.opacity(0.62)], startPoint: .topLeading, endPoint: .bottomTrailing)
         }
         .clipped()
         .animation(.easeInOut(duration: 0.4), value: url)
-        // Decorative only: the blurred, 1.3× scaled poster is larger than the card; never let it take touches.
         .allowsHitTesting(false)
     }
 
+    private func kicker(_ rank: Int) -> String { board.isEmpty ? "TOP \(rank)" : "\(board) · TOP \(rank)" }
+
     @ViewBuilder private func page(_ s: HGSeries, rank: Int) -> some View {
         if landscape {
-            // 横版封面：与竖海报 hero 同卡片/同高度/同信息层级 —— 左上 16:9 封面（时长角标）+ 右侧「榜单 · TOP」与标题，
-            // 下方元信息、标签与白色「查看详情」，页码点仍在右下角。
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 0) {
                 HStack(alignment: .top, spacing: 14) {
                     CoverView(url: s.cover, corner: 12)
                         .frame(width: 176, height: 99)
                         .zoomSource(s.id, ns)
                         .overlay(alignment: .bottomTrailing) { if let p = HomeFmt.progress(s) { HomeBadge(text: p).padding(5) } }
-                        .shadow(color: .black.opacity(0.45), radius: 12, y: 8)
                         .accessibilityIdentifier("home.hero.cover")
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(board.isEmpty ? "TOP \(rank)" : "\(board) · TOP \(rank)").font(.system(size: 11, weight: .heavy)).tracking(0.6)
-                            .foregroundStyle(STVTheme.accentWarm).lineLimit(1)
+                        Text(kicker(rank)).font(.system(size: 11, weight: .heavy)).tracking(0.6)
+                            .foregroundStyle(Color(red: 0.949, green: 0.710, blue: 0.361)).lineLimit(1)
                         Text(s.title).font(.system(size: 16, weight: .bold)).foregroundStyle(.white).lineLimit(3)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                let chips = Array(s.tags.prefix(3))
-                if !chips.isEmpty {
-                    HStack(spacing: 6) {
-                        ForEach(chips, id: \.self) { c in
-                            Text(c).font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.9))
-                                .padding(.horizontal, 7).frame(height: 20)
-                                .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 5))
-                        }
-                    }.lineLimit(1)
-                }
-                let line = [Fmt.meta(s), s.subtitle ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
-                if !line.isEmpty { Text(line).font(.system(size: 12)).foregroundStyle(.white.opacity(0.72)).lineLimit(1) }
+                let line = Fmt.meta(s)
+                if !line.isEmpty { Text(line).font(.system(size: 12)).foregroundStyle(.white.opacity(0.74)).lineLimit(1).padding(.top, 9) }
                 Spacer(minLength: 0)
                 detailButton
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .padding(16)
+            .padding(14)
         } else {
-            HStack(alignment: .center, spacing: 16) {
+            HStack(alignment: .top, spacing: 14) {
                 CoverView(url: s.cover, corner: 12)
-                    .frame(width: 147, height: 196)
+                    .frame(width: 112, height: 112 * 4 / 3)
+                    .overlay {
+                        LinearGradient(stops: [.init(color: .clear, location: 0.46), .init(color: .black.opacity(0.62), location: 1)],
+                                       startPoint: .top, endPoint: .bottom)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if let e = DS.episodes(s) {
+                            Text(e).font(.system(size: 11)).foregroundStyle(.white.opacity(0.9)).padding(.trailing, 8).padding(.bottom, 7)
+                        }
+                    }
                     .zoomSource(s.id, ns)
-                    .overlay(alignment: .bottomTrailing) { if let p = HomeFmt.progress(s) { HomeBadge(text: p).padding(6) } }
-                    .shadow(color: .black.opacity(0.45), radius: 12, y: 8)
-                info(s, rank: rank, lines: 3)
-            }.padding(16)
+                info(s, rank: rank)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
     }
 
-    private func info(_ s: HGSeries, rank: Int, lines: Int) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(board.isEmpty ? "TOP \(rank)" : "\(board) · TOP \(rank)").font(.system(size: 11, weight: .heavy)).tracking(0.6)
-                .foregroundStyle(STVTheme.accentWarm)
+    private func info(_ s: HGSeries, rank: Int) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(kicker(rank)).font(.system(size: 11, weight: .heavy)).tracking(0.6)
+                .foregroundStyle(Color(red: 0.949, green: 0.710, blue: 0.361)).lineLimit(1)
             Text(s.title).font(.system(size: 20, weight: .bold)).foregroundStyle(.white).lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
-            let chips = Array(s.tags.prefix(3))
-            if !chips.isEmpty {
-                HStack(spacing: 6) {
-                    ForEach(chips, id: \.self) { c in
-                        Text(c).font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.9))
-                            .padding(.horizontal, 7).frame(height: 20)
-                            .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 5))
-                    }
-                }.lineLimit(1)
+                .padding(.top, 6)
+            let line1 = [DS.genres(s), s.episodeCount > 0 ? "\(s.episodeCount) 集" : nil].compactMap { $0 }.joined(separator: " · ")
+            let line2 = s.playCount > 0 ? DS.count(s.playCount) + "热度" : (s.actors.isEmpty ? "" : "主演 " + s.actors.prefix(3).joined(separator: " / "))
+            VStack(alignment: .leading, spacing: 0) {
+                if !line1.isEmpty { Text(line1).lineLimit(1) }
+                if !line2.isEmpty { Text(line2).lineLimit(1) }
             }
-            let line = Fmt.meta(s)
-            if !line.isEmpty { Text(line).font(.system(size: 12)).foregroundStyle(.white.opacity(0.72)).lineLimit(1) }
-            if let blurb = s.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines), !blurb.isEmpty, HomeFmt.progress(s) != blurb {
-                Text(blurb).font(.system(size: 12)).foregroundStyle(.white.opacity(0.66)).lineLimit(lines)
-            } else if !s.actors.isEmpty {
-                Text("主演 " + s.actors.prefix(3).joined(separator: " / ")).font(.system(size: 12))
-                    .foregroundStyle(.white.opacity(0.66)).lineLimit(1)
-            }
+            .font(.system(size: 12)).foregroundStyle(.white.opacity(0.74))
+            .lineSpacing(3)
+            .padding(.top, 7)
             Spacer(minLength: 0)
             detailButton
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, landscape ? 0 : 4)
+        .padding(.top, 3).padding(.bottom, 1)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 
     private var detailButton: some View {
-        HStack(spacing: 3) {
-            Image(systemName: "play.fill").font(.system(size: 10, weight: .bold))
-            Text("查看详情").font(.system(size: 13, weight: .bold))
-        }
-        .foregroundStyle(Color(red: 0.067, green: 0.075, blue: 0.094))
-        .padding(.horizontal, 14).frame(height: 32)
-        .background(.white, in: Capsule())
+        PillButtonLabel(title: "查看详情", icon: "play.fill", tone: .white, small: true)
     }
 
     private var dots: some View {
@@ -745,14 +683,103 @@ private struct PosterHero: View {
                 Capsule().fill(i == index ? Color.white : Color.white.opacity(0.4)).frame(width: i == index ? 14 : 5, height: 5)
             }
         }
-        .animation(.easeOut(duration: 0.2), value: index)
-        .padding(.horizontal, 8).frame(height: 20)
-        .background(.black.opacity(0.28), in: Capsule())
-        .padding(12)
+        .animation(DS.select, value: index)
+        .padding(.trailing, 14).padding(.bottom, 14 + 1 + 13.5)
         .opacity(picks.count > 1 ? 1 : 0)
+        .allowsHitTesting(false)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("第 \(index + 1) 部，共 \(picks.count) 部")
         .accessibilityIdentifier("home.hero.dots")
+    }
+}
+
+/// ui-redesign 10 `.cw`: horizontal 继续观看 cards with progress and a round play button.
+struct HomeContinueRow: View {
+    @Environment(\.zoomNS) private var ns
+    let items: [WatchProgress]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            DSSectionHeader(title: "继续观看") {
+                NavigationLink(value: Route.history) { MoreLabel() }.buttonStyle(.plain).accessibilityIdentifier("home.more.继续观看")
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(items.prefix(10)) { p in
+                        ZStack(alignment: .trailing) {
+                            NavigationLink(value: Route.series(p.series)) { card(p) }
+                                .buttonStyle(PressScale(scale: 0.98))
+                                .contextMenu { Button("删除观看记录", systemImage: "trash", role: .destructive) { LibraryStore.shared.removeProgress(p.series) } }
+                            NavigationLink(value: Route.play(p.series, p.episodeIndex)) { playButton }
+                                .buttonStyle(PressScale()).padding(.trailing, 12)
+                                .accessibilityLabel("继续播放 \(p.series.title)")
+                        }
+                    }
+                }
+                .padding(.horizontal, 16).padding(.vertical, 2)
+            }
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        }
+    }
+
+    private func card(_ p: WatchProgress) -> some View {
+        HStack(spacing: 12) {
+            CoverView(url: p.series.cover, corner: 8).frame(width: 52, height: 52 * 4 / 3).zoomSource(p.series.id, ns)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(p.series.title).font(.system(size: 15, weight: .semibold)).foregroundStyle(STVTheme.text).lineLimit(1)
+                Text(line(p)).font(.system(size: 12)).foregroundStyle(STVTheme.secondary).lineLimit(1).padding(.top, 2)
+                DSProgressBar(value: p.fraction).padding(.top, 9)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Color.clear.frame(width: 38, height: 38)
+        }
+        .padding(.leading, 10).padding(.trailing, 12).padding(.vertical, 10)
+        .frame(width: 296)
+        .dsCard(18)
+    }
+
+    private var playButton: some View {
+        Image(systemName: "play.fill").font(.system(size: 13, weight: .bold)).foregroundStyle(STVTheme.bg)
+            .offset(x: 1)
+            .frame(width: 38, height: 38)
+            .background(Circle().fill(STVTheme.text))
+            .contentShape(Circle())
+    }
+
+    private func line(_ p: WatchProgress) -> String {
+        if p.series.source.isLongVideo { return p.resumeLabel }
+        let total = p.series.episodeCount
+        return total > 0 ? "看到第 \(p.episodeNumber) 集 · 共 \(total) 集" : "看到第 \(p.episodeNumber) 集"
+    }
+}
+
+/// ui-redesign 10/11: one horizontally scrolling row per board (`.hs` of 112 pt cells).
+struct HomeShelf: View {
+    let title: String
+    let note: String?
+    let items: [HGSeries]
+    var more: BoardSpec? = nil
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            DSSectionHeader(title: title, note: note) {
+                if let more {
+                    NavigationLink(value: Route.board(more)) { MoreLabel() }.buttonStyle(.plain).accessibilityIdentifier("home.more.\(title)")
+                }
+            }
+            if !items.isEmpty {
+                let landscape = items.first?.isLandscapeCover ?? false
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: 10) {
+                        ForEach(items) { s in
+                            PosterCellView(series: s, subtitle: DS.shelfMeta(s))
+                                .frame(width: landscape ? 200 : 112)
+                                .accessibilityIdentifier("home.card")
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                }
+                .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            }
+        }
     }
 }
 
