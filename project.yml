@@ -15,7 +15,7 @@ packages:
     path: Packages/QuickJS
   AetherEngine:
     url: https://github.com/1021419217/AetherEngine
-    from: 7.62.0
+    branch: main
 targets:
   STV:
     type: application
