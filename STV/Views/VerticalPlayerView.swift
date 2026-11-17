@@ -303,7 +303,7 @@ struct PlayerScreen: View {
         .scrollPosition(id: Binding(get: { co.current }, set: { co.select($0) }), anchor: .center)
         .sensoryFeedback(.selection, trigger: co.current)
         .onChange(of: co.readyIndex) { _, _ in releaseHeldIfSettled() }
-        .onScrollPhaseChange { _, phase in feedSettled = phase == .idle; releaseHeldIfSettled() }
+        .scrollPhaseSettled { settled in feedSettled = settled; releaseHeldIfSettled() }
         .accessibilityIdentifier("player.feed")
         .accessibilityValue(feedSettled ? "idle" : "scrolling")
         .onChange(of: co.current) { old, new in
@@ -1332,5 +1332,18 @@ private struct ChromeFade: ViewModifier {
     var keepAccessible = false
     func body(content: Content) -> some View {
         content.opacity(on ? 1 : 0).allowsHitTesting(on).accessibilityHidden(!on && !keepAccessible)
+    }
+}
+
+/// iOS 17 兼容层：`onScrollPhaseChange` 从 iOS 18 才有。低版本退化为无回调，
+/// `feedSettled` 保持初始 true，播放与静帧释放不受影响（与升级前 3.4 行为一致）。
+private extension View {
+    @ViewBuilder
+    func scrollPhaseSettled(_ onChange: @escaping (Bool) -> Void) -> some View {
+        if #available(iOS 18.0, *) {
+            self.onScrollPhaseChange { _, phase in onChange(phase == .idle) }
+        } else {
+            self
+        }
     }
 }
