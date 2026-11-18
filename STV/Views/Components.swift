@@ -125,14 +125,6 @@ enum RankStyle {
     static func color(_ r: Int) -> Color {
         switch r { case 1: Color(red: 1, green: 0.27, blue: 0.2); case 2: Color(red: 1, green: 0.55, blue: 0.15); case 3: Color(red: 1, green: 0.78, blue: 0.2); default: .white.opacity(0.85) }
     }
-    static func gradient(_ r: Int) -> LinearGradient {
-        let c: [Color] = switch r {
-        case 1: [Color(red: 0.95, green: 0.25, blue: 0.3), Color(red: 0.75, green: 0.1, blue: 0.2)]
-        case 2: [Color(red: 0.25, green: 0.35, blue: 0.95), Color(red: 0.15, green: 0.2, blue: 0.7)]
-        default: [Color(red: 0.98, green: 0.45, blue: 0.25), Color(red: 0.85, green: 0.25, blue: 0.15)]
-        }
-        return LinearGradient(colors: c, startPoint: .top, endPoint: .bottom)
-    }
 }
 
 struct RankNumeral: View {
@@ -259,59 +251,6 @@ struct NumberedGrid: View {
         if !hasMore && !loading && !items.isEmpty {
             Text("没有更多了").font(.caption).foregroundStyle(STVTheme.secondary).frame(maxWidth: .infinity).padding()
         }
-    }
-}
-
-// MARK: Search ranking
-
-struct TopRankCard: View {
-    let series: HGSeries
-    let rank: Int
-    @Environment(\.zoomNS) private var ns
-    var body: some View {
-        NavigationLink(value: Route.series(series)) {
-            ZStack(alignment: .bottom) {
-                CoverView(url: series.cover, corner: 0)
-                RankStyle.gradient(rank).mask(LinearGradient(colors: [.clear, .black, .black], startPoint: .init(x: 0.5, y: 0.35), endPoint: .bottom))
-                VStack(spacing: 2) {
-                    Text("TOP\(rank)").font(.system(size: 24, weight: .black, design: .rounded))
-                    Text(series.title).font(.subheadline.weight(.semibold)).lineLimit(1)
-                    Text(Fmt.meta(series)).font(.caption2).opacity(0.8).lineLimit(1)
-                }
-                .foregroundStyle(.white).padding(.horizontal, 6).padding(.bottom, 10)
-            }
-            .aspectRatio(0.6, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .zoomSource(series.id, ns)
-        }.buttonStyle(.plain)
-    }
-}
-
-struct CompactRankRow: View {
-    @Environment(\.zoomNS) private var ns
-    let series: HGSeries
-    let rank: Int
-    var body: some View {
-        NavigationLink(value: Route.series(series)) {
-            HStack(spacing: 10) {
-                CoverView(url: series.cover, corner: 6)
-                    .frame(width: 46, height: 62)
-                    .zoomSource(series.id, ns)
-                    .overlay(alignment: .topTrailing) {
-                        Text("\(rank)").font(.caption2.weight(.heavy)).foregroundStyle(.white)
-                            .padding(.horizontal, 4).padding(.vertical, 1)
-                            .background(rank <= 3 ? RankStyle.color(rank) : Color(red: 0.8, green: 0.15, blue: 0.25), in: RoundedRectangle(cornerRadius: 3))
-                    }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(series.title).font(.subheadline).foregroundStyle(STVTheme.text).lineLimit(1)
-                    HStack(spacing: 6) {
-                        if series.playCount > 0 { Text(Fmt.count(series.playCount)).foregroundStyle(Color(red: 0.95, green: 0.3, blue: 0.3)) }
-                        Text(series.episodeCount > 0 ? "\(series.episodeCount)集" : "短剧").foregroundStyle(STVTheme.secondary)
-                    }.font(.caption)
-                }
-                Spacer(minLength: 0)
-            }
-        }.buttonStyle(.plain)
     }
 }
 

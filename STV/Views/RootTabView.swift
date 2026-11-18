@@ -5,13 +5,13 @@ import SwiftUI
 struct RootTabView: View {
     @State private var tab = Int(ProcessInfo.processInfo.environment["STV_TAB"] ?? "") ?? 0
     @State private var paths = [NavigationPath(), NavigationPath(), NavigationPath(), NavigationPath()]
-    static let items: [(String, String)] = [("首页", "house.fill"), ("搜索", "magnifyingglass"),
-                                            ("找剧", "square.grid.2x2.fill"), ("我的", "person.crop.circle.fill")]
+    static let items: [(String, String)] = [("首页", "house.fill"), ("收藏", "heart.fill"),
+                                            ("漫画", "book.fill"), ("我的", "person.crop.circle.fill")]
     var body: some View {
         TabView(selection: $tab) {
             Stack(path: $paths[0]) { HomeView() }.tag(0)
-            Stack(path: $paths[1]) { SearchView() }.tag(1)
-            Stack(path: $paths[2]) { CategoryView() }.tag(2)
+            Stack(path: $paths[1]) { LibraryListView(kind: .favorites) }.tag(1)
+            Stack(path: $paths[2]) { MangaHomeView() }.tag(2)
             Stack(path: $paths[3]) { ProfileView() }.tag(3)
         }
         .tint(STVTheme.accent)

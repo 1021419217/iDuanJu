@@ -88,7 +88,8 @@ struct CategoryView: View {
         if let e = pager.error, pager.items.isEmpty {
             ErrorStateView(error: e) { reload() }.padding(.top, 24)
         } else {
-            let items = pager.items
+            // 3.4 精简还原：榜单只留 3 海报 + 6 条榜单行（共 9 个），关闭无限翻页。
+            let items = Array(pager.items.prefix(9))
             LazyVGrid(columns: Self.cols, spacing: 16) {
                 ForEach(Array(items.prefix(3).enumerated()), id: \.element.id) { i, s in
                     PosterCellView(series: s, rank: i + 1)
@@ -102,9 +103,7 @@ struct CategoryView: View {
                         if i > 0 { Hairline() }
                         RankListRow(series: s, rank: i + 4)
                     }
-                    .onAppear { if i + 3 == items.count - 1, pager.hasMore, !pager.isLoading { pager.loadMore() } }
                 }
-                footer
             }
             .padding(.horizontal, 16).padding(.top, 12)
         }
@@ -125,16 +124,15 @@ struct CategoryView: View {
         if let e = pager.error, pager.items.isEmpty {
             ErrorStateView(error: e) { reload() }.padding(.top, 24)
         } else if panel != nil {
-            let items = pager.items
+            // 3.4 精简还原：筛选找片只留前 9 个（3 行），关闭无限翻页。
+            let items = Array(pager.items.prefix(9))
             LazyVGrid(columns: Self.cols, spacing: 16) {
                 ForEach(Array(items.enumerated()), id: \.element.id) { i, s in
                     PosterCellView(series: s, subtitle: DS.genres(s) ?? DS.heat(s))
-                        .onAppear { if i == items.count - 1, pager.hasMore, !pager.isLoading { pager.loadMore() } }
                 }
                 if pager.isLoading { skeletonCells(items.isEmpty ? 6 : 3) }
             }
             .padding(.horizontal, 16).padding(.top, 16)
-            footer
         }
     }
 
@@ -248,12 +246,6 @@ struct CategoryView: View {
         .dsBar(23)
         .padding(.horizontal, 12).padding(.top, 2)
         .accessibilityIdentifier("filter.sticky")
-    }
-
-    @ViewBuilder private var footer: some View {
-        if !pager.hasMore && !pager.isLoading && !pager.items.isEmpty {
-            Text("没有更多了").font(.system(size: 12)).foregroundStyle(STVTheme.tertiary).frame(maxWidth: .infinity).padding(.vertical, 18)
-        }
     }
 
     private func skeletonCells(_ n: Int) -> some View {
